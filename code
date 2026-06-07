@@ -1,0 +1,2564 @@
+-- ============================================================
+--  🔴 TheConstructor01 AI v1.1
+--  → Pathfinding completo
+--  → Ataque melee con hitbox por área (como el Beast)
+--  → Onda normal: 3 proyectiles hacia adelante
+--  → Onda trampa: abanico de 5 ondas para cerrar salidas (cooldown 20s)
+--  → Todas las hitboxes usan GetPartBoundsInBox igual que el Beast
+-- ============================================================
+
+local PathfindingService = game:GetService("PathfindingService")
+local Players            = game:GetService("Players")
+local Debris             = game:GetService("Debris")
+local RunService         = game:GetService("RunService")
+
+local killer   = script.Parent
+local humanoid = killer:WaitForChild("Humanoid")
+local hrp      = killer:WaitForChild("HumanoidRootPart")
+local animator = humanoid:WaitForChild("Animator")
+
+-- ✅ Desanclar TODAS las partes del modelo al iniciar
+for _, part in killer:GetDescendants() do
+	if part:IsA("BasePart") then
+		part.Anchored = false
+	end
+end
+
+-- ✅ Desactivar el script de animaciones por defecto de Roblox
+local defaultAnimate = killer:FindFirstChild("Animate")
+if defaultAnimate then defaultAnimate.Enabled = false end
+
+-- ============================================================
+--  ⚙️ CONFIGURACION
+-- ============================================================
+local CFG = {
+	PATROL_SPEED  = 10,
+	CHASE_SPEED   = 28,
+
+	ATTACK_RANGE    = 7.0,
+	DAMAGE_NORMAL   = 35,
+	COOLDOWN_NORMAL = 0.8,
+	KNOCKBACK_FORCE = 45,
+
+	WAVE_RANGE_MIN  = 15,
+	WAVE_RANGE_MAX  = 55,
+	WAVE_COUNT      = 3,
+	WAVE_INTERVAL   = 0.35,
+	WAVE_SPEED      = 60,
+	WAVE_DAMAGE     = 28,
+	WAVE_LIFETIME   = 3.0,
+	WAVE_SIZE       = Vector3.new(3.5, 5, 1.5),
+	COOLDOWN_WAVE   = 6.0,
+
+	TRAP_RANGE      = 22,
+	TRAP_COUNT      = 5,
+	TRAP_SPREAD     = 80,
+	TRAP_SPEED      = 42,
+	TRAP_DAMAGE     = 22,
+	TRAP_LIFETIME   = 2.8,
+	TRAP_SIZE       = Vector3.new(4.5, 6, 1.8),
+	COOLDOWN_TRAP   = 20.0,
+
+	PATH_RECOMPUTE_DIST = 7,
+	PATH_RECOMPUTE_TIME = 1.8,
+	WAYPOINT_DIST       = 2.5,
+	WAYPOINT_TIMEOUT    = 3.0,
+	STUCK_CHECK_TIME    = 0.8,
+	STUCK_MIN_DIST      = 0.8,
+
+	AGENT_PARAMS = {
+		AgentRadius     = 3.5,
+		AgentHeight     = 3.5,
+		AgentCanJump    = true,
+		AgentCanClimb   = true,
+		WaypointSpacing = 2,
+	},
+
+	-- ⚠️ Rellena estos IDs con los tuyos
+	ANIM = {
+		IDLE   = "113878566727653",
+		WALK   = "105750121699430",
+		RUN    = "101650500499626",
+		ATTACK = "78437117585184",
+		WAVE   = "125696942766927",
+	},
+
+	SFX = {
+		HIT         = "101925560775623",
+		WAVE_LAUNCH = "138186576",
+		TRAP_LAUNCH = "138186576",
+		WAVE_HIT    = "138186576",
+	},
+}
+
+-- ============================================================
+--  📊 ESTADOS
+-- ============================================================
+local STATE = {
+	EXPLORE = "EXPLORE",
+	CHASE   = "CHASE",
+	ATTACK  = "ATTACK",
+	WAVE    = "WAVE",
+	TRAP    = "TRAP",
+}
+
+-- ============================================================
+--  🧠 MEMORIA
+-- ============================================================
+local ai = {
+	state               = STATE.EXPLORE,
+	target              = nil,
+	isAttacking         = false,
+	isWaving            = false,
+	lastNormalTime      = 0,
+	lastWaveTime        = 0,
+	lastTrapTime        = 0,
+	pathThread          = nil,
+	lastPathComputePos  = Vector3.zero,
+	lastPathComputeTime = 0,
+	stuckPos            = hrp.Position,
+	stuckAccum          = 0,
+	exploreTarget       = nil,
+}
+
+-- ============================================================
+--  🎵 ANIMACIONES
+-- ============================================================
+local tracks = {}
+for name, id in pairs(CFG.ANIM) do
+	local anim = Instance.new("Animation")
+	anim.AnimationId = "rbxassetid://" .. id
+	local t = animator:LoadAnimation(anim)
+	if name == "ATTACK" or name == "WAVE" then
+		t.Priority = Enum.AnimationPriority.Action
+	end
+	tracks[name] = t
+end
+
+local function playAnim(name, fade)
+	local t = tracks[name]
+	if t and not t.IsPlaying then t:Play(fade or 0.15) end
+end
+local function stopAnim(name, fade)
+	local t = tracks[name]
+	if t and t.IsPlaying then t:Stop(fade or 0.15) end
+end
+local function stopMoveAnims()
+	stopAnim("IDLE", 0.08); stopAnim("WALK", 0.08); stopAnim("RUN", 0.08)
+end
+
+-- ============================================================
+--  🧭 ORIENTACION SUAVE
+-- ============================================================
+humanoid.AutoRotate = false
+local rootAtt  = Instance.new("Attachment", hrp)
+local alignOri = Instance.new("AlignOrientation", hrp)
+alignOri.Mode           = Enum.OrientationAlignmentMode.OneAttachment
+alignOri.Attachment0    = rootAtt
+alignOri.MaxTorque      = 2e6
+alignOri.Responsiveness = 220
+
+local _facingPos = nil
+RunService.Heartbeat:Connect(function()
+	if _facingPos then
+		local look = Vector3.new(_facingPos.X, hrp.Position.Y, _facingPos.Z)
+		if (look - hrp.Position).Magnitude > 0.5 then
+			alignOri.CFrame = CFrame.lookAt(hrp.Position, look)
+		end
+	end
+end)
+local function face(pos) _facingPos = pos end
+
+-- ============================================================
+--  🔊 SONIDO
+-- ============================================================
+local function sfx(id, vol, pitch)
+	local s = Instance.new("Sound", hrp)
+	s.SoundId            = "rbxassetid://" .. id
+	s.Volume             = vol or 1
+	s.PlaybackSpeed      = pitch or 1
+	s.RollOffMaxDistance = 80
+	s:Play()
+	Debris:AddItem(s, 4)
+end
+
+-- ============================================================
+--  👁️ PERCEPCION
+-- ============================================================
+local function getBestTarget()
+	local best, bestDist = nil, math.huge
+	for _, p in Players:GetPlayers() do
+		local char = p.Character
+		if char and char:FindFirstChild("Humanoid") and char.Humanoid.Health > 0
+			and char:FindFirstChild("HumanoidRootPart") then
+			local dist = (char.HumanoidRootPart.Position - hrp.Position).Magnitude
+			if dist < bestDist then bestDist = dist; best = char end
+		end
+	end
+	return best
+end
+
+-- ============================================================
+--  💥 KNOCKBACK
+-- ============================================================
+local function applyKnockback(tHRP, direction, force)
+	if not tHRP or not tHRP.Parent then return end
+	local att = Instance.new("Attachment", tHRP)
+	local lv  = Instance.new("LinearVelocity", tHRP)
+	lv.Attachment0    = att
+	lv.VectorVelocity = direction.Unit * force
+	lv.MaxForce       = 6e5
+	Debris:AddItem(lv,  0.14)
+	Debris:AddItem(att, 0.14)
+end
+
+-- ============================================================
+--  ⚔️ ATAQUE MELEE
+--  Hitbox: GetPartBoundsInBox centrada adelante del killer
+-- ============================================================
+local function normalAttack()
+	if ai.isAttacking then return end
+	ai.isAttacking = true
+	humanoid:MoveTo(hrp.Position)
+	stopMoveAnims()
+	tracks.ATTACK:Play(0.05)
+
+	local fired = false
+	local function doHit()
+		if fired then return end; fired = true
+		local hitCF   = hrp.CFrame * CFrame.new(0, 0, -4)
+		local hitSize = Vector3.new(8, 6, 9)
+		local params  = OverlapParams.new()
+		params.FilterDescendantsInstances = {killer}
+		params.FilterType = Enum.RaycastFilterType.Exclude
+
+		for _, part in workspace:GetPartBoundsInBox(hitCF, hitSize, params) do
+			local model = part:FindFirstAncestorOfClass("Model")
+			if model and model ~= killer then
+				local hum  = model:FindFirstChildOfClass("Humanoid")
+				local tHRP = model:FindFirstChild("HumanoidRootPart")
+				if hum and hum.Health > 0 then
+					hum:TakeDamage(CFG.DAMAGE_NORMAL)
+					sfx(CFG.SFX.HIT, 0.9, 0.85)
+					if tHRP then
+						applyKnockback(tHRP, tHRP.Position - hrp.Position + Vector3.new(0,0.4,0), CFG.KNOCKBACK_FORCE)
+					end
+				end
+			end
+		end
+	end
+
+	local conn = tracks.ATTACK:GetMarkerReachedSignal("NormalAttack"):Connect(doHit)
+	task.delay(0.5, doHit)
+	tracks.ATTACK.Stopped:Wait()
+	conn:Disconnect()
+	ai.isAttacking    = false
+	ai.lastNormalTime = tick()
+end
+
+local ServerStorage = game:GetService("ServerStorage")
+
+-- ============================================================
+--  🌊 PROYECTIL — clona la Union de ServerStorage
+--  Hitbox: GetPartBoundsInBox que sigue el CFrame del Part en movimiento
+-- ============================================================
+local function spawnProjectile(startCF, direction, speed, size, damage, lifetime)
+	-- ✅ Clona tu Union roja de ServerStorage
+	local waveTemplate = ServerStorage:FindFirstChild("ConstructWaver")
+	if not waveTemplate then
+		warn("[TheConstructor01] No se encontró 'ConstructWaver' en ServerStorage")
+		return
+	end
+
+	local wave = waveTemplate:Clone()
+	wave.CanCollide = false
+	wave.Anchored   = false
+	wave.CastShadow = false
+	wave.CFrame     = startCF
+	wave.Parent     = workspace
+	Debris:AddItem(wave, lifetime)
+
+	local att = Instance.new("Attachment", wave)
+	local lv  = Instance.new("LinearVelocity", wave)
+	lv.Attachment0    = att
+	lv.VectorVelocity = direction * speed
+	lv.MaxForce       = math.huge
+
+	-- ✅ HITBOX: GetPartBoundsInBox sigue el Part cada frame
+	local alreadyHit = {}
+	local conn
+	conn = RunService.Heartbeat:Connect(function()
+		if not wave or not wave.Parent then conn:Disconnect(); return end
+
+		local params = OverlapParams.new()
+		params.FilterDescendantsInstances = {killer, wave}
+		params.FilterType = Enum.RaycastFilterType.Exclude
+
+		for _, part in workspace:GetPartBoundsInBox(wave.CFrame, wave.Size * 1.3, params) do
+			local model = part:FindFirstAncestorOfClass("Model")
+			if model and model ~= killer and not alreadyHit[model] then
+				local hum  = model:FindFirstChildOfClass("Humanoid")
+				local tHRP = model:FindFirstChild("HumanoidRootPart")
+				if hum and hum.Health > 0 then
+					alreadyHit[model] = true
+					hum:TakeDamage(damage)
+					sfx(CFG.SFX.WAVE_HIT, 1.0, 0.75)
+					if tHRP then
+						applyKnockback(tHRP, direction + Vector3.new(0, 0.3, 0), 55)
+					end
+				end
+			end
+		end
+	end)
+
+	task.delay(lifetime, function()
+		conn:Disconnect()
+		if wave and wave.Parent then wave:Destroy() end
+	end)
+end
+
+-- ============================================================
+--  🌊 ONDA NORMAL — Shockwave: partes que se spawnean en el suelo una tras otra
+--  Atraviesa paredes, se detiene al golpear jugador o al llegar al límite
+-- ============================================================
+local function waveAttack(targetPos)
+	if ai.isWaving or ai.isAttacking then return end
+	ai.isWaving = true
+	humanoid:MoveTo(hrp.Position)
+	face(targetPos)
+	stopMoveAnims()
+	tracks.WAVE:Play(0.05)
+
+	local fired = false
+	local function doWave()
+		if fired then return end; fired = true
+		sfx(CFG.SFX.WAVE_LAUNCH, 1.2, 0.7)
+
+		local dir = (Vector3.new(targetPos.X, hrp.Position.Y, targetPos.Z) - hrp.Position)
+		dir = dir.Magnitude > 0.1 and dir.Unit or hrp.CFrame.LookVector
+
+		local waveTemplate = ServerStorage:FindFirstChild("ConstructWaver")
+		if not waveTemplate then warn("[TheConstructor01] No se encontró 'ConstructWaver' en ServerStorage"); return end
+
+		local stepDist   = 3    -- studs entre cada parte
+		local maxSteps   = math.floor(CFG.WAVE_RANGE_MAX / stepDist)
+		local stepDelay  = 0.04 -- segundos entre cada parte (más rápido = más continuo)
+		local partLife   = 0.35 -- cuánto dura visible cada parte
+		local stopped    = false
+		local alreadyHit = {}
+
+		task.spawn(function()
+			for i = 1, maxSteps do
+				if stopped then break end
+
+				local spawnPos = hrp.Position + dir * (i * stepDist)
+
+				-- Raycast hacia abajo para poner la parte en el suelo
+				local rayParams = RaycastParams.new()
+				rayParams.FilterDescendantsInstances = {killer}
+				rayParams.FilterType = Enum.RaycastFilterType.Exclude
+				local groundHit = workspace:Raycast(spawnPos + Vector3.new(0, 5, 0), Vector3.new(0, -15, 0), rayParams)
+				local groundY = groundHit and groundHit.Position.Y or spawnPos.Y
+
+				-- Clonar la parte en esa posición
+				local wave = waveTemplate:Clone()
+				wave.CanCollide = false
+				wave.Anchored   = true  -- ✅ Anclada, no se mueve — solo aparece y desaparece
+				wave.CastShadow = false
+				wave.CFrame     = CFrame.lookAt(
+					Vector3.new(spawnPos.X, groundY + (waveTemplate.Size.Y / 2), spawnPos.Z),
+					Vector3.new(spawnPos.X + dir.X, groundY + (waveTemplate.Size.Y / 2), spawnPos.Z + dir.Z)
+				)
+				wave.Parent = workspace
+				Debris:AddItem(wave, partLife)
+
+				-- ✅ Hitbox sobre esta parte
+				local params = OverlapParams.new()
+				params.FilterDescendantsInstances = {killer, wave}
+				params.FilterType = Enum.RaycastFilterType.Exclude
+
+				for _, part in workspace:GetPartBoundsInBox(wave.CFrame, wave.Size * 1.2, params) do
+					local model = part:FindFirstAncestorOfClass("Model")
+					if model and model ~= killer and not alreadyHit[model] then
+						local hum  = model:FindFirstChildOfClass("Humanoid")
+						local tHRP = model:FindFirstChild("HumanoidRootPart")
+						if hum and hum.Health > 0 then
+							alreadyHit[model] = true
+							hum:TakeDamage(CFG.WAVE_DAMAGE)
+							sfx(CFG.SFX.WAVE_HIT, 1.0, 0.75)
+							-- ✅ Lanza al jugador hacia arriba
+							if tHRP then
+								applyKnockback(tHRP, Vector3.new(dir.X * 0.2, 1, dir.Z * 0.2), 85)
+							end
+							stopped = true
+							break
+						end
+					end
+				end
+
+				task.wait(stepDelay)
+			end
+		end)
+	end
+
+	local conn = tracks.WAVE:GetMarkerReachedSignal("ONDADEATAQUE!"):Connect(doWave)
+	task.delay(0.6, doWave)
+	tracks.WAVE.Stopped:Wait()
+	conn:Disconnect()
+	ai.isWaving     = false
+	ai.lastWaveTime = tick()
+end
+
+-- ============================================================
+--  🧱 ONDA TRAMPA — Abanico de 5 ondas, forma pared (cooldown 20s)
+-- ============================================================
+local function trapAttack(targetPos)
+	if ai.isWaving or ai.isAttacking then return end
+	ai.isWaving = true
+	humanoid:MoveTo(hrp.Position)
+	face(targetPos)
+	stopMoveAnims()
+	tracks.WAVE:Play(0.05)
+
+	local fired = false
+	local function doTrap()
+		if fired then return end; fired = true
+		sfx(CFG.SFX.TRAP_LAUNCH, 1.5, 0.5)
+		local baseDir = (Vector3.new(targetPos.X, hrp.Position.Y, targetPos.Z) - hrp.Position)
+		baseDir = baseDir.Magnitude > 0.1 and baseDir.Unit or hrp.CFrame.LookVector
+		local halfSpread = CFG.TRAP_SPREAD / 2
+
+		for i = 1, CFG.TRAP_COUNT do
+			local t     = (i - 1) / math.max(CFG.TRAP_COUNT - 1, 1)
+			local angle = math.rad(-halfSpread + t * CFG.TRAP_SPREAD)
+			local dir   = CFrame.Angles(0, angle, 0) * baseDir
+
+			task.delay((i - 1) * 0.07, function()
+				local spawnCF = CFrame.lookAt(hrp.Position, hrp.Position + dir) * CFrame.new(0, 0, -3)
+				spawnProjectile(spawnCF, dir, CFG.TRAP_SPEED, CFG.TRAP_SIZE, CFG.TRAP_DAMAGE, CFG.TRAP_LIFETIME)
+			end)
+		end
+	end
+
+	local conn = tracks.WAVE:GetMarkerReachedSignal("ONDADEATAQUE!"):Connect(doTrap)
+	task.delay(0.6, doTrap)
+	tracks.WAVE.Stopped:Wait()
+	conn:Disconnect()
+	ai.isWaving     = false
+	ai.lastTrapTime = tick()
+end
+
+-- ============================================================
+--  🗺️ NAVEGACION HIBRIDA
+--  Prioridad: Directo > Steering (raycasts) > PathfindingService
+-- ============================================================
+local function cancelPath()
+	if ai.pathThread then task.cancel(ai.pathThread); ai.pathThread = nil end
+end
+
+local navParams = RaycastParams.new()
+navParams.FilterDescendantsInstances = {killer}
+navParams.FilterType = Enum.RaycastFilterType.Exclude
+
+-- NIVEL 1: Línea de visión directa al destino
+local function hasDirectPath(dest)
+	local origin = hrp.Position + Vector3.new(0, 1, 0)
+	local dir    = (dest + Vector3.new(0, 1, 0)) - origin
+	if dir.Magnitude < 0.1 then return true end
+	local hit       = workspace:Raycast(origin, dir, navParams)
+	local groundHit = workspace:Raycast(dest + Vector3.new(0, 3, 0), Vector3.new(0, -8, 0), navParams)
+	return not hit and groundHit ~= nil
+end
+
+-- NIVEL 2: Steering con raycasts — esquiva sin PathfindingService
+local function getSteerDir(dest)
+	local toTarget  = (dest - hrp.Position)
+	local flatDest  = Vector3.new(toTarget.X, 0, toTarget.Z).Unit
+	local bestDir, bestScore = nil, -math.huge
+
+	for a = 0, 7 do
+		local angle   = (a / 8) * math.pi * 2
+		local testDir = Vector3.new(math.cos(angle), 0, math.sin(angle))
+		local hit     = workspace:Raycast(hrp.Position + Vector3.new(0,1,0), testDir * 5, navParams)
+		local free    = not hit or hit.Distance > 3.5
+		if free then
+			local score = testDir:Dot(flatDest)
+			if score > bestScore then bestScore = score; bestDir = testDir end
+		end
+	end
+	return bestDir
+end
+
+-- ✅ Ground snap: encuentra el suelo real debajo de una posición
+-- Evita que el path apunte al jugador flotando en el aire
+local groundSnapParams = RaycastParams.new()
+groundSnapParams.FilterDescendantsInstances = {killer}
+groundSnapParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function groundSnap(pos)
+	-- Busca suelo hasta 40 studs abajo
+	local hit = workspace:Raycast(pos + Vector3.new(0, 3, 0), Vector3.new(0, -40, 0), groundSnapParams)
+	if hit then
+		return Vector3.new(pos.X, hit.Position.Y + 0.5, pos.Z)
+	end
+	-- Si no hay suelo abajo, busca arriba (jugador debajo de una rampa)
+	local hitUp = workspace:Raycast(pos - Vector3.new(0, 3, 0), Vector3.new(0, 40, 0), groundSnapParams)
+	if hitUp then
+		return Vector3.new(pos.X, hitUp.Position.Y + 0.5, pos.Z)
+	end
+	return pos
+end
+
+-- NIVEL 3: PathfindingService — solo laberintos complejos
+local function followPath(dest)
+	-- ✅ Snap al suelo antes de calcular — evita waypoints en el aire
+	local snappedDest = groundSnap(dest)
+
+	local path = PathfindingService:CreatePath(CFG.AGENT_PARAMS)
+	local ok   = pcall(function() path:ComputeAsync(hrp.Position, snappedDest) end)
+	if not ok or path.Status ~= Enum.PathStatus.Success then
+		-- Intentar con la posición original si el snap falla
+		ok = pcall(function() path:ComputeAsync(hrp.Position, dest) end)
+		if not ok or path.Status ~= Enum.PathStatus.Success then
+			local steerDir = getSteerDir(dest)
+			humanoid:MoveTo(steerDir and hrp.Position + steerDir * 10 or dest)
+			ai.pathThread = nil
+			return
+		end
+	end
+
+	local waypoints = path:GetWaypoints()
+	for i = 2, #waypoints do
+		if ai.isAttacking or ai.isWaving then ai.pathThread = nil; return end
+		if ai.state == STATE.ATTACK or ai.state == STATE.WAVE or ai.state == STATE.TRAP then ai.pathThread = nil; return end
+
+		local wp         = waypoints[i]
+		local heightDiff = wp.Position.Y - hrp.Position.Y
+		local onGround   = humanoid.FloorMaterial ~= Enum.Material.Air
+
+		if (wp.Action == Enum.PathWaypointAction.Jump or heightDiff > 0.5) and onGround then
+			humanoid.Jump = true
+		end
+		humanoid:MoveTo(wp.Position)
+		face(wp.Position)
+
+		local elapsed = 0
+		while elapsed < CFG.WAYPOINT_TIMEOUT do
+			task.wait(0.05); elapsed += 0.05
+			if (wp.Position.Y - hrp.Position.Y) > 0.5 and humanoid.FloorMaterial ~= Enum.Material.Air then
+				humanoid.Jump = true
+			end
+			if (hrp.Position - wp.Position).Magnitude < CFG.WAYPOINT_DIST then break end
+			if hasDirectPath(dest) then ai.pathThread = nil; return end
+		end
+	end
+	ai.pathThread = nil
+end
+
+-- Decide qué nivel de navegación usar para moverse al destino
+local function navigateTo(dest, now)
+	-- Cooldown: no recalcular si el destino no cambió suficiente
+	local movedEnough = (dest - ai.lastPathComputePos).Magnitude > CFG.PATH_RECOMPUTE_DIST
+	local timeExpired = (now - ai.lastPathComputeTime) > CFG.PATH_RECOMPUTE_TIME
+
+	if not movedEnough and not timeExpired and ai.pathThread ~= nil then return end
+
+	ai.lastPathComputePos  = dest
+	ai.lastPathComputeTime = now
+
+	-- NIVEL 1: Línea de visión directa
+	if hasDirectPath(dest) then
+		cancelPath()
+		humanoid:MoveTo(dest)
+		face(dest)
+		return
+	end
+
+	-- NIVEL 2: Steering con raycasts — 16 direcciones para más precisión
+	local toTarget  = (dest - hrp.Position)
+	local flatDest  = Vector3.new(toTarget.X, 0, toTarget.Z)
+	if flatDest.Magnitude > 0.1 then flatDest = flatDest.Unit end
+	local bestDir, bestScore = nil, -math.huge
+
+	for a = 0, 15 do
+		local angle   = (a / 16) * math.pi * 2
+		local testDir = Vector3.new(math.cos(angle), 0, math.sin(angle))
+		local hit     = workspace:Raycast(hrp.Position + Vector3.new(0,1,0), testDir * 6, navParams)
+		local free    = not hit or hit.Distance > 4
+		if free then
+			local score = testDir:Dot(flatDest)
+			if score > bestScore then bestScore = score; bestDir = testDir end
+		end
+	end
+
+	if bestDir then
+		cancelPath()
+		local steerDest = hrp.Position + bestDir * 14
+		humanoid:MoveTo(steerDest)
+		face(steerDest)
+		return
+	end
+
+	-- NIVEL 3: PathfindingService
+	cancelPath()
+	ai.pathThread = task.spawn(followPath, dest)
+end
+
+-- ============================================================
+--  🦯 ANTI-ATASCO
+-- ============================================================
+RunService.Heartbeat:Connect(function(dt)
+	local moving = ai.state == STATE.CHASE or ai.state == STATE.EXPLORE
+	if moving and not ai.isAttacking and not ai.isWaving then
+		ai.stuckAccum += dt
+		if ai.stuckAccum >= CFG.STUCK_CHECK_TIME then
+			if (hrp.Position - ai.stuckPos).Magnitude < CFG.STUCK_MIN_DIST then
+				humanoid.Jump = true
+				local rp = RaycastParams.new()
+				rp.FilterDescendantsInstances = {killer}
+				rp.FilterType = Enum.RaycastFilterType.Exclude
+				local bestAngle, bestDist = 0, -1
+				for a = 0, 7 do
+					local angle = (a / 8) * math.pi * 2
+					local dir   = Vector3.new(math.cos(angle), 0, math.sin(angle))
+					local hit   = workspace:Raycast(hrp.Position, dir * 10, rp)
+					local d     = hit and hit.Distance or 10
+					if d > bestDist then bestDist = d; bestAngle = angle end
+				end
+				humanoid:MoveTo(hrp.Position + Vector3.new(math.cos(bestAngle), 0, math.sin(bestAngle)) * 8)
+				cancelPath(); ai.lastPathComputeTime = 0; ai.lastPathComputePos = Vector3.zero
+				if ai.target then
+					local tHRP = ai.target:FindFirstChild("HumanoidRootPart")
+					if tHRP then
+						ai.lastPathComputeTime = 0
+						navigateTo(tHRP.Position, tick())
+					end
+				end
+			end
+			ai.stuckPos = hrp.Position; ai.stuckAccum = 0
+		end
+	else
+		ai.stuckPos = hrp.Position; ai.stuckAccum = 0
+	end
+end)
+
+-- ============================================================
+--  👁️ HILO DE PERCEPCION (0.1s)
+-- ============================================================
+task.spawn(function()
+	while task.wait(0.1) do
+		local candidate = getBestTarget()
+		if candidate then
+			ai.target = candidate
+			if ai.state == STATE.EXPLORE then cancelPath(); ai.state = STATE.CHASE end
+		else
+			if ai.state ~= STATE.EXPLORE then
+				ai.state = STATE.EXPLORE; ai.target = nil; ai.exploreTarget = nil; cancelPath()
+			end
+		end
+	end
+end)
+
+-- ============================================================
+--  🤖 HILO PRINCIPAL (0.05s)
+-- ============================================================
+task.spawn(function()
+	playAnim("IDLE", 0.1)
+	while task.wait(0.05) do
+		local now = tick()
+		local s   = ai.state
+
+		if s == STATE.EXPLORE then
+			humanoid.WalkSpeed = CFG.PATROL_SPEED
+			if not ai.exploreTarget or (hrp.Position - ai.exploreTarget).Magnitude < 5 then
+				local angle = math.random() * math.pi * 2
+				local r     = 30 + math.random() * 30
+				ai.exploreTarget = hrp.Position + Vector3.new(math.cos(angle)*r, 0, math.sin(angle)*r)
+				cancelPath()
+				face(ai.exploreTarget)
+			end
+			if ai.exploreTarget then navigateTo(ai.exploreTarget, now) end
+
+		elseif s == STATE.CHASE then
+			if not ai.target or not ai.target:FindFirstChild("HumanoidRootPart")
+				or ai.target.Humanoid.Health <= 0 then
+				ai.state = STATE.EXPLORE; ai.target = nil; cancelPath()
+			else
+				humanoid.WalkSpeed = CFG.CHASE_SPEED
+				local tHRP = ai.target.HumanoidRootPart
+				local dist = (tHRP.Position - hrp.Position).Magnitude
+				face(tHRP.Position)
+
+				if dist <= CFG.ATTACK_RANGE then
+					cancelPath(); ai.state = STATE.ATTACK
+
+					-- Trampa tiene prioridad si el jugador está cerca y el cooldown está listo
+				elseif dist <= CFG.TRAP_RANGE and now - ai.lastTrapTime > CFG.COOLDOWN_TRAP then
+					cancelPath(); ai.state = STATE.TRAP
+
+				elseif dist >= CFG.WAVE_RANGE_MIN and dist <= CFG.WAVE_RANGE_MAX
+					and now - ai.lastWaveTime > CFG.COOLDOWN_WAVE then
+					cancelPath(); ai.state = STATE.WAVE
+
+				else
+					navigateTo(tHRP.Position, now)
+					if tHRP.Position.Y > hrp.Position.Y + 2.8 then humanoid.Jump = true end
+				end
+			end
+
+		elseif s == STATE.ATTACK then
+			if not ai.target or not ai.target:FindFirstChild("HumanoidRootPart")
+				or ai.target.Humanoid.Health <= 0 then
+				ai.state = STATE.EXPLORE; ai.target = nil
+			else
+				local tHRP = ai.target.HumanoidRootPart
+				local dist = (tHRP.Position - hrp.Position).Magnitude
+				face(tHRP.Position)
+				if dist > CFG.ATTACK_RANGE * 1.6 then
+					ai.state = STATE.CHASE; ai.lastPathComputeTime = 0
+				elseif not ai.isAttacking and now - ai.lastNormalTime > CFG.COOLDOWN_NORMAL then
+					humanoid:MoveTo(dist > CFG.ATTACK_RANGE * 0.8 and tHRP.Position or hrp.Position)
+					task.spawn(normalAttack)
+				end
+			end
+
+		elseif s == STATE.WAVE then
+			if not ai.target or not ai.target:FindFirstChild("HumanoidRootPart")
+				or ai.target.Humanoid.Health <= 0 then
+				ai.state = STATE.EXPLORE; ai.target = nil
+			elseif not ai.isWaving then
+				local tHRP = ai.target.HumanoidRootPart
+				task.spawn(function() waveAttack(tHRP.Position); ai.state = STATE.CHASE end)
+			end
+
+		elseif s == STATE.TRAP then
+			if not ai.target or not ai.target:FindFirstChild("HumanoidRootPart")
+				or ai.target.Humanoid.Health <= 0 then
+				ai.state = STATE.EXPLORE; ai.target = nil
+			elseif not ai.isWaving then
+				local tHRP = ai.target.HumanoidRootPart
+				task.spawn(function() trapAttack(tHRP.Position); ai.state = STATE.CHASE end)
+			end
+		end
+	end
+end)
+
+-- ============================================================
+--  🎬 ANIMACIONES DE MOVIMIENTO
+-- ============================================================
+humanoid.Running:Connect(function(spd)
+	if ai.isAttacking or ai.isWaving then return end
+	if spd > 18 then
+		stopAnim("IDLE"); stopAnim("WALK"); playAnim("RUN",  0.2)
+	elseif spd > 1 then
+		stopAnim("IDLE"); stopAnim("RUN");  playAnim("WALK", 0.2)
+	else
+		stopAnim("WALK"); stopAnim("RUN");  playAnim("IDLE", 0.2)
+	end
+end)
+
+playAnim("IDLE", 0.1)
+print("[HARKEN v1.1] ✅ Iniciado.")
+
+--============================================================
+--  🔴 IntoTheChaos v21.2 "PATHFINDING MODERNO 2025"
+--  Base: v21.1 — Solo se reemplazó el sistema de navegación.
+--  Nuevo sistema:
+--    * PathfindingService con waypoints y eventos (no loops)
+--    * Path.Blocked → recomputa automáticamente
+--    * MoveToFinished → avanza al siguiente waypoint
+--    * LOS directo cuando hay línea de visión
+--    * Stuck detection limpia
+--    * Sin radar ni memoria de obstáculos (innecesario con paths)
+--============================================================
+
+--// SERVICIOS
+local PathfindingService = game:GetService("PathfindingService")
+local Players            = game:GetService("Players")
+local Debris             = game:GetService("Debris")
+local TweenService       = game:GetService("TweenService")
+local RunService         = game:GetService("RunService")
+local CollectionService  = game:GetService("CollectionService")
+
+--// REFERENCIAS
+local killer    = script.Parent
+local humanoid  = killer:WaitForChild("Humanoid")
+local hrp       = killer:WaitForChild("HumanoidRootPart")
+local animator  = humanoid:WaitForChild("Animator")
+
+--============================================================
+--  ⚙️ CONFIGURACION
+--============================================================
+local CFG = {
+	PATROL_SPEED    = 12,
+	ALERT_SPEED     = 20,
+	CHASE_SPEED     = 34,
+	RAGE_SPEED      = 46,
+
+	FOV_ANGLE       = 110,
+	FOV_DISTANCE    = 65,
+	HEAR_RADIUS     = 40,
+	HEAR_SPEED_MIN  = 4,
+	MEMORY_TIME     = 9,
+
+	ATTACK_RANGE    = 7.5,
+	HEAVY_RANGE     = 5.0,
+	LUNGE_RANGE_MIN = 12,
+	LUNGE_RANGE_MAX = 24,
+
+	DAMAGE_LIGHT    = 22,
+	DAMAGE_HEAVY    = 52,
+	DAMAGE_LUNGE    = 35,
+	COMBO_DMG_MULT  = 0.25,
+	MAX_COMBO       = 3,
+	COMBO_WINDOW    = 1.6,
+
+	COOLDOWN_LIGHT  = 0.45,
+	COOLDOWN_HEAVY  = 3.5,
+	COOLDOWN_LUNGE  = 5.5,
+
+	LUNGE_FORCE     = 95,
+	LUNGE_WINDUP    = 0.3,
+	KNOCKBACK_FORCE = 50,
+
+	LUNGE_HIT_RADIUS   = 5.0,
+	LUNGE_HIT_TICK     = 0.05,
+	LUNGE_HIT_MAX_TIME = 1.2,
+	LUNGE_HIT_MAX_HITS = 1,
+
+	RAGE_HITS       = 5,
+	RAGE_DURATION   = 15,
+	RAGE_DMG_MULT   = 1.65,
+	RAGE_LUNGE_PROB = 0.45,
+
+	-- Navegación moderna
+	WAYPOINT_DIST       = 2.0,    -- ↑ un poco más tolerante evita micro-correcciones
+	WAYPOINT_TIMEOUT    = 4.0,    -- reducido: si tarda más de 4s en un wp, algo está mal
+	PATH_RECOMPUTE_DIST = 6,      -- ↑ recomputar menos seguido = menos lag de paths
+	PATH_RECOMPUTE_TIME = 2.0,    -- cada 2s es suficiente para seguir bien al jugador
+	STUCK_TIME          = 1.2,    -- detectar stuck un poco más rápido
+	STUCK_MIN_DIST      = 0.6,    -- threshold menor = más sensible a micro-stucks
+	LOS_UPDATE_RATE     = 0.04,   -- 25fps en LOS directo, buen balance
+
+	-- Predicción de movimiento (LOS directo)
+	PREDICT_FACTOR      = 0.35,   -- cuánto adelantarse al jugador (0=posición actual, 1=1s adelante)
+
+	FLANK_ENABLED   = true,
+	FLANK_OFFSET    = 15,
+	FLANK_PROB      = 0.45,
+
+	EXPLORE_RADIUS_MIN  = 30,
+	EXPLORE_RADIUS_MAX  = 80,
+	EXPLORE_EXPAND_TIME = 12,
+	EXPLORE_ZONE_MEMORY = 8,
+	EXPLORE_ZONE_REUSE  = 20,
+	EXPLORE_WAIT_MIN    = 0.5,
+	EXPLORE_WAIT_MAX    = 1.5,
+
+	GHOST_MODE_DURATION    = 5,
+	GHOST_MODE_COOLDOWN    = 30,
+	GHOST_MODE_SPEED_MULT  = 1.5,
+	GHOST_MODE_TRANSPARENCY = 0.7,
+	GHOST_MODE_TRIGGER_TIME = 10,
+
+	AGENT_PARAMS = {
+		AgentRadius     = 2.0,
+		AgentHeight     = 5.0,
+		AgentCanJump    = true,
+		AgentCanClimb   = true,
+		WaypointSpacing = 3.0,    -- ↑ waypoints más espaciados = paths más eficientes
+		Costs = { Stairs = 0.5 }
+	},
+
+	ANIM = {
+		IDLE   = "107418821005483",
+		WALK   = "80290015175284",
+		RUN    = "130005017476314",
+		ATTACK = "117706598933129",
+		HEAVY  = "73902310941791",
+		LUNGE  = "113073986105874",
+		ROAR   = "73962697616159",
+	},
+
+	SFX = {
+		HIT   = "101925560775623",
+		ROAR  = "125513735785967",
+		BREAK = "140616663978880",
+		STEP  = "139955989389582",
+		GHOST = "9125787168",
+	},
+}
+
+--============================================================
+--  📊 ESTADOS
+--============================================================
+local STATE = {
+	EXPLORE = "EXPLORE",
+	CHASE   = "CHASE",
+	ATTACK  = "ATTACK",
+	LUNGE   = "LUNGE",
+	GHOST   = "GHOST",
+}
+
+--============================================================
+--  🧠 MEMORIA DE LA IA
+--============================================================
+local ai = {
+	state            = STATE.EXPLORE,
+	target           = nil,
+	lastKnownPos     = nil,
+	lastSeenTime     = 0,
+
+	isAttacking      = false,
+	isLunging        = false,
+	comboCount       = 0,
+	lastComboTime    = 0,
+	lastLightTime    = 0,
+	lastHeavyTime    = 0,
+	lastLungeTime    = 0,
+
+	rageHits         = 0,
+	rageActive       = false,
+	rageEndTime      = 0,
+
+	exploreTarget    = nil,
+	exploreWaitUntil = 0,
+	exploreRadius    = 35,
+	exploreExpandedAt = tick(),
+	visitedZones     = {},
+	visitedZoneIdx   = 0,
+
+	isFlanking       = false,
+	lastFlankTime    = 0,
+
+	ghostModeActive  = false,
+	ghostModeEndTime = 0,
+	ghostModeLastUse = 0,
+	chaseStartTime   = 0,
+	lastDamageTime   = 0,
+}
+
+--============================================================
+--  🎵 ANIMACIONES
+--============================================================
+local tracks = {}
+for name, id in pairs(CFG.ANIM) do
+	local anim = Instance.new("Animation")
+	anim.AnimationId = "rbxassetid://" .. id
+	local t = animator:LoadAnimation(anim)
+	if name == "ATTACK" or name == "HEAVY" or name == "LUNGE" or name == "ROAR" then
+		t.Priority = Enum.AnimationPriority.Action
+	end
+	tracks[name] = t
+end
+
+local function playAnim(name, fade)
+	local t = tracks[name]
+	if t and not t.IsPlaying then t:Play(fade or 0.15) end
+end
+
+local function stopAnim(name, fade)
+	local t = tracks[name]
+	if t and t.IsPlaying then t:Stop(fade or 0.15) end
+end
+
+local function stopMoveAnims()
+	stopAnim("IDLE", 0.08)
+	stopAnim("WALK", 0.08)
+	stopAnim("RUN",  0.08)
+end
+
+--============================================================
+--  🔊 SONIDO
+--============================================================
+local function sfx(id, vol, pitch)
+	local s = Instance.new("Sound", hrp)
+	s.SoundId            = "rbxassetid://" .. (id or "138186576")
+	s.Volume             = vol or 1
+	s.PlaybackSpeed      = pitch or 1
+	s.RollOffMaxDistance = 90
+	s:Play()
+	Debris:AddItem(s, 4)
+end
+
+--============================================================
+--  👁️ PERCEPCIÓN
+--============================================================
+local navParams = RaycastParams.new()
+navParams.FilterDescendantsInstances = {killer}
+navParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function hasLOS(fromPos, toPos)
+	local origin = fromPos + Vector3.new(0, 1.5, 0)
+	local dir    = (toPos + Vector3.new(0, 1, 0)) - origin
+	local result = workspace:Raycast(origin, dir, navParams)
+	return not result or result.Distance >= dir.Magnitude * 0.92
+end
+
+local function getNearestPlayer()
+	local nearest, minDist = nil, math.huge
+	for _, p in Players:GetPlayers() do
+		local char = p.Character
+		if char and char:FindFirstChild("Humanoid") and char.Humanoid.Health > 0
+			and char:FindFirstChild("HumanoidRootPart") then
+			local dist = (char.HumanoidRootPart.Position - hrp.Position).Magnitude
+			if dist < minDist then
+				minDist = dist
+				nearest = char
+			end
+		end
+	end
+	return nearest, minDist
+end
+
+--============================================================
+--  🧭 ORIENTACION CINEMATICA
+--============================================================
+humanoid.AutoRotate = false
+
+local rootAtt = hrp:FindFirstChild("_BeastRootAtt") or Instance.new("Attachment", hrp)
+rootAtt.Name  = "_BeastRootAtt"
+
+local alignOri = hrp:FindFirstChild("_BeastAlignOri") or Instance.new("AlignOrientation", hrp)
+alignOri.Name           = "_BeastAlignOri"
+alignOri.Mode           = Enum.OrientationAlignmentMode.OneAttachment
+alignOri.Attachment0    = rootAtt
+alignOri.MaxTorque      = 1e4
+alignOri.Responsiveness = 20
+
+local _facingPos  = nil
+local _currentYaw = hrp.CFrame.LookVector
+
+RunService.Heartbeat:Connect(function(dt)
+	if not _facingPos then return end
+	local lookTarget = Vector3.new(_facingPos.X, hrp.Position.Y, _facingPos.Z)
+	local toTarget   = lookTarget - hrp.Position
+	if toTarget.Magnitude < 0.5 then return end
+
+	local desired = toTarget.Unit
+	local speed   = math.clamp(toTarget.Magnitude / 5, 4, 20)
+	local alpha   = math.clamp(dt * speed, 0, 1)
+
+	local nx = _currentYaw.X + (desired.X - _currentYaw.X) * alpha
+	local nz = _currentYaw.Z + (desired.Z - _currentYaw.Z) * alpha
+	local m  = math.sqrt(nx*nx + nz*nz)
+	if m < 0.001 then return end
+	_currentYaw = Vector3.new(nx/m, 0, nz/m)
+
+	local dot = math.clamp(_currentYaw.X*desired.X + _currentYaw.Z*desired.Z, -1, 1)
+	if dot < 0.9998 then
+		alignOri.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + _currentYaw)
+	end
+end)
+
+local function face(pos) _facingPos = pos end
+
+--============================================================
+--  💥 DAÑO Y KNOCKBACK
+--============================================================
+local function applyKnockback(tHRP, direction, force)
+	if not tHRP or not tHRP.Parent then return end
+	local att = tHRP:FindFirstChildOfClass("Attachment") or Instance.new("Attachment", tHRP)
+	local lv  = Instance.new("LinearVelocity", tHRP)
+	lv.Attachment0    = att
+	lv.VectorVelocity = direction.Unit * force
+	lv.MaxForce       = 6e5
+	Debris:AddItem(lv, 0.14)
+end
+
+local function areaHit(damage, radius, offsetZ, alreadyHit)
+	local center = (hrp.CFrame * CFrame.new(0, 0, -(offsetZ or 4))).Position
+	local params = OverlapParams.new()
+	params.FilterDescendantsInstances = {killer}
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	alreadyHit = alreadyHit or {}
+
+	for _, part in workspace:GetPartBoundsInRadius(center, radius or 6, params) do
+		local model = part:FindFirstAncestorOfClass("Model")
+		if model and model ~= killer and not alreadyHit[model] then
+			local hum  = model:FindFirstChildOfClass("Humanoid")
+			local tHRP = model:FindFirstChild("HumanoidRootPart")
+			if hum and hum.Health > 0 then
+				alreadyHit[model] = true
+				local mult = ai.rageActive and CFG.RAGE_DMG_MULT or 1
+				hum:TakeDamage(math.floor(damage * mult))
+				if tHRP then
+					applyKnockback(tHRP, tHRP.Position - hrp.Position + Vector3.new(0,0.5,0), CFG.KNOCKBACK_FORCE)
+				end
+			end
+		end
+	end
+	return alreadyHit
+end
+
+--============================================================
+--  ⚔️ ATAQUES
+--============================================================
+local function lightAttack()
+	if ai.isAttacking then return end
+	ai.isAttacking = true
+
+	local now = tick()
+	ai.comboCount    = (now - ai.lastComboTime < CFG.COMBO_WINDOW) and math.min(ai.comboCount+1, CFG.MAX_COMBO) or 1
+	ai.lastComboTime = now
+
+	humanoid:MoveTo(hrp.Position)
+	stopMoveAnims()
+	tracks.ATTACK:Play(0.05)
+
+	local fired = false
+	local function doHit()
+		if fired then return end; fired = true
+		local dmg = CFG.DAMAGE_LIGHT * (1 + (ai.comboCount-1) * CFG.COMBO_DMG_MULT)
+		areaHit(dmg, 6.5, 4)
+		sfx(CFG.SFX.HIT, 0.8, 0.88 + ai.comboCount * 0.07)
+	end
+
+	local conn = tracks.ATTACK:GetMarkerReachedSignal("IntoTheChaosAttack!"):Connect(doHit)
+	task.delay(0.45, doHit)
+
+	local startTime = tick()
+	task.spawn(function()
+		while ai.isAttacking and tick()-startTime < 3 do task.wait(0.1) end
+		conn:Disconnect()
+		if tracks.ATTACK.IsPlaying then tracks.ATTACK:Stop(0.1) end
+		ai.isAttacking = false; ai.lastLightTime = tick()
+	end)
+
+	tracks.ATTACK.Stopped:Wait()
+	conn:Disconnect()
+	ai.isAttacking = false; ai.lastLightTime = tick()
+end
+
+local function heavyAttack()
+	if ai.isAttacking then return end
+	ai.isAttacking = true
+
+	humanoid:MoveTo(hrp.Position)
+	stopMoveAnims()
+	tracks.HEAVY:Play(0.05)
+
+	local fired = false
+	local function doHit()
+		if fired then return end; fired = true
+		areaHit(CFG.DAMAGE_HEAVY, 10, 5)
+		sfx(CFG.SFX.HIT, 1.5, 0.52)
+	end
+
+	local conn = tracks.HEAVY:GetMarkerReachedSignal("IntoTheChaosAttack!"):Connect(doHit)
+	task.delay(0.45, doHit)
+
+	local startTime = tick()
+	task.spawn(function()
+		while ai.isAttacking and tick()-startTime < 4 do task.wait(0.1) end
+		conn:Disconnect()
+		if tracks.HEAVY.IsPlaying then tracks.HEAVY:Stop(0.1) end
+		ai.isAttacking = false; ai.lastHeavyTime = tick(); ai.lastLightTime = tick()
+	end)
+
+	tracks.HEAVY.Stopped:Wait()
+	conn:Disconnect()
+	ai.isAttacking = false; ai.lastHeavyTime = tick(); ai.lastLightTime = tick()
+end
+
+local function performLunge(tHRP)
+	if ai.isLunging or ai.isAttacking then return end
+	ai.isLunging = true; ai.isAttacking = true
+
+	stopMoveAnims()
+	tracks.LUNGE:Play(0.05)
+	face(tHRP.Position)
+	task.wait(CFG.LUNGE_WINDUP)
+	sfx(CFG.SFX.ROAR, 1.2, 0.62)
+
+	local dir    = (tHRP.Position - hrp.Position + Vector3.new(0, 0.25, 0)).Unit
+	local att    = Instance.new("Attachment", hrp)
+	local lv     = Instance.new("LinearVelocity", hrp)
+	lv.Attachment0    = att
+	lv.VectorVelocity = dir * CFG.LUNGE_FORCE
+	lv.MaxForce       = 9e5
+	humanoid.WalkSpeed = 0
+
+	local elapsed = 0; local hitsLeft = CFG.LUNGE_HIT_MAX_HITS; local hitTable = {}
+	while elapsed < CFG.LUNGE_HIT_MAX_TIME and hitsLeft > 0 do
+		task.wait(CFG.LUNGE_HIT_TICK); elapsed += CFG.LUNGE_HIT_TICK
+		local p2 = OverlapParams.new()
+		p2.FilterDescendantsInstances = {killer}; p2.FilterType = Enum.RaycastFilterType.Exclude
+		for _, part in workspace:GetPartBoundsInRadius(hrp.Position, CFG.LUNGE_HIT_RADIUS, p2) do
+			local model = part:FindFirstAncestorOfClass("Model")
+			if model and model ~= killer and not hitTable[model] then
+				local hum  = model:FindFirstChildOfClass("Humanoid")
+				local mHRP = model:FindFirstChild("HumanoidRootPart")
+				if hum and hum.Health > 0 then
+					hitTable[model] = true; hitsLeft -= 1
+					local mult = ai.rageActive and CFG.RAGE_DMG_MULT or 1
+					hum:TakeDamage(math.floor(CFG.DAMAGE_LUNGE * mult))
+					sfx(CFG.SFX.HIT, 1.2, 0.65)
+					if mHRP then applyKnockback(mHRP, dir + Vector3.new(0,0.6,0), CFG.KNOCKBACK_FORCE*1.8) end
+					if hitsLeft <= 0 then break end
+				end
+			end
+		end
+	end
+
+	lv:Destroy(); att:Destroy()
+	local startTime = tick()
+	task.spawn(function()
+		while ai.isLunging and tick()-startTime < 3 do task.wait(0.1) end
+		if tracks.LUNGE.IsPlaying then tracks.LUNGE:Stop(0.1) end
+		humanoid.WalkSpeed = ai.rageActive and CFG.RAGE_SPEED or CFG.CHASE_SPEED
+		ai.isLunging = false; ai.isAttacking = false
+		ai.lastLungeTime = tick(); ai.lastLightTime = tick()
+	end)
+
+	task.wait(0.15)
+	tracks.LUNGE.Stopped:Wait()
+	humanoid.WalkSpeed = ai.rageActive and CFG.RAGE_SPEED or CFG.CHASE_SPEED
+	ai.isLunging = false; ai.isAttacking = false
+	ai.lastLungeTime = tick(); ai.lastLightTime = tick()
+end
+
+--============================================================
+--  😠 RAGE MODE
+--============================================================
+local function activateRage()
+	if ai.rageActive then ai.rageEndTime = tick() + CFG.RAGE_DURATION; return end
+	ai.rageActive  = true
+	ai.rageEndTime = tick() + CFG.RAGE_DURATION
+	ai.rageHits    = 0
+
+	for _, p in killer:GetDescendants() do
+		if p:IsA("BasePart") and p.Name ~= "HumanoidRootPart" then
+			local orig = p.Color
+			TweenService:Create(p, TweenInfo.new(0.12), {Color = Color3.fromRGB(220,25,25)}):Play()
+			task.delay(0.7, function()
+				if p and p.Parent then TweenService:Create(p, TweenInfo.new(0.5), {Color=orig}):Play() end
+			end)
+		end
+	end
+	sfx(CFG.SFX.ROAR, 1.5, 0.38)
+	tracks.ROAR:Play(0.05)
+	print("[IntoTheChaos] 😠 RAGE MODE")
+end
+
+humanoid.HealthChanged:Connect(function()
+	ai.rageHits += 1
+	if ai.rageHits >= CFG.RAGE_HITS then activateRage() end
+	ai.lastDamageTime = tick()
+end)
+
+--============================================================
+--  🔨 ROTURA DE OBSTÁCULOS
+--============================================================
+local function breakObstacles()
+	local forward = hrp.CFrame.LookVector
+	local dirs    = {forward*5, (CFrame.Angles(0,math.rad(28),0)*forward)*5, (CFrame.Angles(0,math.rad(-28),0)*forward)*5}
+	local params  = RaycastParams.new()
+	params.FilterDescendantsInstances = {killer}
+	params.FilterType = Enum.RaycastFilterType.Exclude
+
+	for _, dir in ipairs(dirs) do
+		local hit = workspace:Raycast(hrp.Position, dir, params)
+		if hit and hit.Instance then
+			local inst = hit.Instance
+			if inst:GetAttribute("Breakable") or CollectionService:HasTag(inst,"Breakable")
+				or inst.Name == "Door" or inst.Name == "Glass" or inst.Name == "Breakable" then
+				local mdl = inst:FindFirstAncestorOfClass("Model")
+				local h   = mdl and mdl:FindFirstChildOfClass("Humanoid")
+				if h then h:TakeDamage(9999) else inst:Destroy() end
+				sfx(CFG.SFX.BREAK, 0.9, 1.1)
+				break
+			end
+		end
+	end
+end
+
+--============================================================
+--  👻 MODO FANTASMA
+--============================================================
+local function activateGhostMode()
+	if ai.ghostModeActive then return end
+	local now = tick()
+	if now - ai.ghostModeLastUse < CFG.GHOST_MODE_COOLDOWN then return end
+
+	ai.ghostModeActive   = true
+	ai.ghostModeEndTime  = now + CFG.GHOST_MODE_DURATION
+	ai.ghostModeLastUse  = now
+
+	for _, part in ipairs(killer:GetDescendants()) do
+		if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then
+			part.Transparency = CFG.GHOST_MODE_TRANSPARENCY
+		end
+	end
+
+	sfx(CFG.SFX.GHOST, 1.0, 1.0)
+	humanoid.WalkSpeed = humanoid.WalkSpeed * CFG.GHOST_MODE_SPEED_MULT
+	print("[IntoTheChaos] 👻 Modo Fantasma activado")
+end
+
+local function deactivateGhostMode()
+	if not ai.ghostModeActive then return end
+	ai.ghostModeActive = false
+
+	for _, part in ipairs(killer:GetDescendants()) do
+		if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then
+			part.Transparency = 0
+		end
+	end
+
+	humanoid.WalkSpeed = ai.rageActive and CFG.RAGE_SPEED or CFG.CHASE_SPEED
+	print("IntoTheChaos] 👻 Modo Fantasma desactivado")
+end
+
+--============================================================
+--  🗺️ NAVEGACIÓN MODERNA 2025
+--  Usa PathfindingService con eventos (Path.Blocked, MoveToFinished)
+--  en vez de loops. LOS directo cuando hay visión.
+--============================================================
+
+-- Estado de navegación
+local NAV = {
+	thread     = nil,   -- tarea activa de seguimiento de waypoints
+	active     = false,
+	dest       = Vector3.zero,
+	startTime  = 0,
+	liveRef    = nil,   -- referencia viva al HumanoidRootPart del target
+}
+
+-- Anclar al suelo real (fix rampas)
+local function groundSnap(pos)
+	local hit = workspace:Raycast(pos + Vector3.new(0,4,0), Vector3.new(0,-50,0), navParams)
+	if hit then return Vector3.new(pos.X, hit.Position.Y + 0.5, pos.Z) end
+	return pos
+end
+
+-- Posición actual del target (viva)
+local function getLivePos()
+	if NAV.liveRef and NAV.liveRef.Parent then return NAV.liveRef.Position end
+	return NAV.dest
+end
+
+-- Cancelar navegación activa
+local function cancelNav()
+	NAV.active = false
+	if NAV.thread then
+		task.cancel(NAV.thread)
+		NAV.thread = nil
+	end
+end
+
+-- ── Función principal de navegación ─────────────────────────
+-- Usa el método moderno: Path.Blocked event + MoveToFinished event
+local function runPath(dest)
+	NAV.active    = true
+	NAV.dest      = dest
+	NAV.startTime = tick()
+
+	local snapped = groundSnap(dest)
+
+	-- ── MODO LOS DIRECTO ────────────────────────────────────
+	-- Si hay línea de visión, seguir al jugador con predicción
+	if hasLOS(hrp.Position, snapped) then
+		while NAV.active do
+			task.wait(CFG.LOS_UPDATE_RATE)
+			if not NAV.active then return end
+			if ai.isAttacking or ai.isLunging then NAV.active = false; return end
+
+			local cur = getLivePos()
+
+			-- Llegamos
+			if (hrp.Position - cur).Magnitude < CFG.WAYPOINT_DIST then
+				NAV.active = false; return
+			end
+			-- Perdimos LOS → cambiar a pathfinding
+			if not hasLOS(hrp.Position, cur) then
+				NAV.active = false; return
+			end
+
+			-- ✅ PREDICCIÓN: apuntar a donde estará el jugador en PREDICT_FACTOR segundos
+			-- Esto hace que el killer "adelante" al jugador en vez de seguirlo de atrás
+			local liveRef = NAV.liveRef
+			local predicted = cur
+			if liveRef and liveRef.Parent then
+				local vel     = liveRef.AssemblyLinearVelocity
+				local flatVel = Vector3.new(vel.X, 0, vel.Z)
+				if flatVel.Magnitude > 2 then
+					predicted = cur + flatVel * CFG.PREDICT_FACTOR
+					-- Solo usar predicción si el punto predicho también tiene LOS
+					if not hasLOS(hrp.Position, predicted) then
+						predicted = cur
+					end
+				end
+			end
+
+			face(predicted)
+			humanoid:MoveTo(predicted)
+			if cur.Y > hrp.Position.Y + 2.5 then humanoid.Jump = true end
+		end
+		NAV.active = false; return
+	end
+
+	-- ── MODO PATHFINDING (sin LOS) ───────────────────────────
+	local path = PathfindingService:CreatePath(CFG.AGENT_PARAMS)
+
+	-- Calcular path
+	local ok = pcall(function() path:ComputeAsync(hrp.Position, snapped) end)
+	if not ok or path.Status ~= Enum.PathStatus.Success then
+		-- Fallback: intentar sin snap
+		ok = pcall(function() path:ComputeAsync(hrp.Position, dest) end)
+		if not ok or path.Status ~= Enum.PathStatus.Success then
+			-- Último recurso: ir directo
+			humanoid:MoveTo(dest)
+			task.wait(2)
+			NAV.active = false; return
+		end
+	end
+
+	local wps = path:GetWaypoints()
+	if #wps < 2 then
+		humanoid:MoveTo(dest); task.wait(0.5); NAV.active = false; return
+	end
+
+	-- ── Evento Path.Blocked ──────────────────────────────────
+	-- Si el path se bloquea, recomputar automáticamente
+	local blockedConn = path.Blocked:Connect(function(blockedIdx)
+		if blockedIdx > 1 then
+			-- Recomputar desde posición actual
+			breakObstacles()
+			NAV.active = false  -- señal para salir del loop y recomputar
+		end
+	end)
+
+	-- Variables de stuck detection
+	local stuckTimer = 0
+	local stuckRef   = hrp.Position
+
+	local i = 2
+	while i <= #wps and NAV.active do
+		if ai.isAttacking or ai.isLunging then NAV.active = false; break end
+
+		local livePos = getLivePos()
+
+		-- Target se alejó mucho → recomputar
+		if (livePos - dest).Magnitude > CFG.PATH_RECOMPUTE_DIST then
+			NAV.active = false; break
+		end
+
+		-- Recuperamos LOS → cambiar a modo directo
+		if hasLOS(hrp.Position, livePos) then
+			while NAV.active do
+				task.wait(CFG.LOS_UPDATE_RATE)
+				local cp = getLivePos()
+				if (hrp.Position - cp).Magnitude < CFG.WAYPOINT_DIST then
+					NAV.active = false; break
+				end
+				if not hasLOS(hrp.Position, cp) then
+					NAV.active = false; break
+				end
+				face(cp)
+				humanoid:MoveTo(cp)
+				if cp.Y > hrp.Position.Y + 2.5 then humanoid.Jump = true end
+			end
+			break
+		end
+
+		local wp = wps[i]
+
+		-- ✅ WAYPOINT SKIP: si podemos ver el waypoint siguiente directamente,
+		-- saltamos el actual para un path más fluido y rápido
+		if i < #wps then
+			local nextWp = wps[i + 1]
+			if hasLOS(hrp.Position, nextWp.Position) then
+				i += 1
+				continue
+			end
+		end
+
+		face(wp.Position)
+
+		-- Saltar si el waypoint lo requiere o está más alto
+		if wp.Action == Enum.PathWaypointAction.Jump
+			or (wp.Position.Y - hrp.Position.Y) > 0.8 then
+			if humanoid.FloorMaterial ~= Enum.Material.Air then
+				humanoid.Jump = true
+				task.wait(0.12)
+			end
+		end
+
+		humanoid:MoveTo(wp.Position)
+
+		-- ── Esperar MoveToFinished con timeout ───────────────
+		local arrived = false
+		local elapsed = 0
+
+		local moveConn = humanoid.MoveToFinished:Connect(function(reached)
+			arrived = true
+		end)
+
+		while not arrived and elapsed < CFG.WAYPOINT_TIMEOUT and NAV.active do
+			task.wait(0.05)
+			elapsed += 0.05
+
+			-- Stuck detection mejorado
+			stuckTimer += 0.05
+			if stuckTimer >= CFG.STUCK_TIME then
+				local moved = (hrp.Position - stuckRef).Magnitude
+				if moved < CFG.STUCK_MIN_DIST then
+					-- ✅ STUCK RECOVERY MEJORADO:
+					-- 1. Saltar
+					humanoid.Jump = true
+					task.wait(0.1)
+					-- 2. Retroceder brevemente para desatascarse
+					local back = hrp.CFrame.LookVector * -4
+					humanoid:MoveTo(hrp.Position + back)
+					task.wait(0.15)
+					-- 3. Romper obstáculos
+					breakObstacles()
+					moveConn:Disconnect()
+					blockedConn:Disconnect()
+					NAV.active = false
+					return
+				end
+				stuckTimer = 0
+				stuckRef   = hrp.Position
+			end
+
+			-- Si ya llegamos por distancia
+			if (hrp.Position - wp.Position).Magnitude < CFG.WAYPOINT_DIST then
+				arrived = true
+			end
+		end
+
+		moveConn:Disconnect()
+
+		if not arrived then
+			-- Timeout → saltar e intentar continuar
+			humanoid.Jump = true
+			task.wait(0.1)
+		end
+
+		i += 1
+	end
+
+	blockedConn:Disconnect()
+	NAV.active = false
+end
+
+-- ── navTo: cancela path anterior y lanza el nuevo ────────────
+local function navTo(dest, liveRef)
+	cancelNav()
+	NAV.liveRef = liveRef
+	NAV.dest    = dest
+	NAV.thread  = task.spawn(runPath, dest)
+end
+
+-- ── Decidir si recomputar ─────────────────────────────────────
+local function navNeedsRecompute(newDest)
+	if not NAV.active then return true end
+	if (newDest - NAV.dest).Magnitude > CFG.PATH_RECOMPUTE_DIST then return true end
+	if tick() - NAV.startTime > CFG.PATH_RECOMPUTE_TIME then return true end
+	return false
+end
+
+-- ── Actualizar nav en chase ───────────────────────────────────
+local function chaseNavUpdate(targetHRP)
+	NAV.liveRef = targetHRP  -- siempre actualizar referencia viva
+	local dest  = targetHRP.Position
+	if navNeedsRecompute(dest) then
+		navTo(dest, targetHRP)
+	end
+end
+
+--============================================================
+--  🗺️ EXPLORACIÓN
+--============================================================
+local function isPointSafe(pos)
+	-- Verificar que hay suelo debajo
+	local hit = workspace:Raycast(pos + Vector3.new(0,2,0), Vector3.new(0,-15,0), navParams)
+	if not hit then return false end  -- vacío debajo
+
+	-- Verificar que no está en el borde de una caída
+	-- Comprueba los 4 lados a 2 studs de distancia
+	local offsets = {
+		Vector3.new(2,0,0), Vector3.new(-2,0,0),
+		Vector3.new(0,0,2), Vector3.new(0,0,-2),
+	}
+	local edgeCount = 0
+	for _, offset in ipairs(offsets) do
+		local sidePos = pos + offset
+		local sideHit = workspace:Raycast(sidePos + Vector3.new(0,2,0), Vector3.new(0,-15,0), navParams)
+		if not sideHit then
+			edgeCount += 1
+		end
+	end
+	-- Si 3+ lados tienen vacío, es una esquina peligrosa
+	return edgeCount < 3
+end
+
+local function registerVisited(pos)
+	ai.visitedZoneIdx = (ai.visitedZoneIdx % CFG.EXPLORE_ZONE_MEMORY) + 1
+	ai.visitedZones[ai.visitedZoneIdx] = pos
+end
+
+local function isTooNearVisited(pos)
+	for _, vz in ipairs(ai.visitedZones) do
+		if (pos - vz).Magnitude < CFG.EXPLORE_ZONE_REUSE then return true end
+	end
+	return false
+end
+
+local function newExplorePoint()
+	local now = tick()
+	if now - ai.exploreExpandedAt > CFG.EXPLORE_EXPAND_TIME then
+		ai.exploreRadius      = math.min(ai.exploreRadius + 15, CFG.EXPLORE_RADIUS_MAX)
+		ai.exploreExpandedAt  = now
+	end
+	for attempt = 1, 20 do
+		local baseAngle   = (attempt / 20) * math.pi * 2
+		local randOffset  = (math.random() - 0.5) * math.pi * 0.6
+		local angle       = baseAngle + randOffset
+		local r           = CFG.EXPLORE_RADIUS_MIN + math.random() * (ai.exploreRadius - CFG.EXPLORE_RADIUS_MIN)
+		local candidate   = hrp.Position + Vector3.new(math.cos(angle)*r, 0, math.sin(angle)*r)
+		if not isTooNearVisited(candidate) and isPointSafe(candidate) then
+			return candidate
+		end
+	end
+	ai.visitedZones   = {}
+	ai.visitedZoneIdx = 0
+	ai.exploreRadius  = CFG.EXPLORE_RADIUS_MIN
+	return hrp.Position + Vector3.new(0, 0, 10)
+end
+
+--============================================================
+--  🤖 HILO PRINCIPAL
+--============================================================
+task.spawn(function()
+	playAnim("WALK", 0.1)
+
+	while task.wait(0.1) do
+		local now   = tick()
+		local speed = ai.rageActive and CFG.RAGE_SPEED or CFG.CHASE_SPEED
+
+		-- Rage timeout
+		if ai.rageActive and now > ai.rageEndTime then
+			ai.rageActive = false
+		end
+
+		-- Ghost mode timeout
+		if ai.ghostModeActive and now > ai.ghostModeEndTime then
+			deactivateGhostMode()
+		end
+
+		-- Actualizar target
+		local nearest = getNearestPlayer()
+		ai.target = nearest or nil
+		if nearest then
+			ai.lastKnownPos = nearest.HumanoidRootPart.Position
+		end
+
+		-- Sin jugador → explorar
+		if not ai.target then
+			if ai.state ~= STATE.EXPLORE then
+				cancelNav()
+				ai.state = STATE.EXPLORE
+			end
+		else
+			local tHRP = ai.target.HumanoidRootPart
+			local dist = (tHRP.Position - hrp.Position).Magnitude
+			face(tHRP.Position)
+			local dest = tHRP.Position
+
+			-- Ghost mode activo
+			if ai.ghostModeActive then
+				ai.state = STATE.GHOST
+				humanoid.WalkSpeed = CFG.CHASE_SPEED * CFG.GHOST_MODE_SPEED_MULT
+				chaseNavUpdate(tHRP)
+
+			elseif dist <= CFG.ATTACK_RANGE then
+				ai.state = STATE.ATTACK
+				cancelNav()
+
+			elseif dist >= CFG.LUNGE_RANGE_MIN and dist <= CFG.LUNGE_RANGE_MAX
+				and now - ai.lastLungeTime > CFG.COOLDOWN_LUNGE
+				and not ai.isAttacking then
+				if math.random() < (ai.rageActive and CFG.RAGE_LUNGE_PROB or 0.25) then
+					ai.state = STATE.LUNGE
+					cancelNav()
+				else
+					ai.state = STATE.CHASE
+				end
+			else
+				ai.state = STATE.CHASE
+			end
+
+			-- Chase logic
+			if ai.state == STATE.CHASE then
+				humanoid.WalkSpeed = speed
+
+				-- Flanqueo
+				if CFG.FLANK_ENABLED and not ai.isFlanking and dist > 25
+					and math.random() < CFG.FLANK_PROB and now - ai.lastFlankTime > 8 then
+					local vel     = tHRP.AssemblyLinearVelocity
+					local flatVel = Vector3.new(vel.X, 0, vel.Z)
+					if flatVel.Magnitude > 0.5 then
+						local perp    = Vector3.new(-flatVel.Z, 0, flatVel.X).Unit
+						local side    = math.random(0,1) == 0 and 1 or -1
+						local flankDest = tHRP.Position + flatVel.Unit*10 + perp*CFG.FLANK_OFFSET*side
+						local groundHit = workspace:Raycast(flankDest + Vector3.new(0,5,0), Vector3.new(0,-20,0), navParams)
+						if groundHit then
+							-- ✅ FIX: navegar al destino de flankeo, no al target directo
+							navTo(flankDest, tHRP)
+							ai.isFlanking    = true
+							ai.lastFlankTime = now
+							task.delay(5, function() ai.isFlanking = false end)
+						end
+					end
+				end
+
+				-- Solo actualizar nav normal si no estamos flanqueando
+				if not ai.isFlanking then
+					chaseNavUpdate(tHRP)
+				end
+
+				-- Trigger ghost mode si lleva mucho tiempo persiguiendo
+				if not ai.ghostModeActive then
+					if ai.chaseStartTime == 0 then
+						ai.chaseStartTime = now
+					elseif now - ai.chaseStartTime > CFG.GHOST_MODE_TRIGGER_TIME then
+						activateGhostMode()
+						ai.chaseStartTime = 0
+					end
+				else
+					ai.chaseStartTime = 0
+				end
+			end
+		end
+
+		-- ── Estados específicos ──────────────────────────────
+		if ai.state == STATE.EXPLORE then
+			humanoid.WalkSpeed = CFG.PATROL_SPEED
+			if not ai.exploreTarget
+				or (hrp.Position - ai.exploreTarget).Magnitude < 8 then
+				if now >= ai.exploreWaitUntil then
+					registerVisited(hrp.Position)
+					ai.exploreTarget    = newExplorePoint()
+					ai.exploreWaitUntil = now + math.random() * (CFG.EXPLORE_WAIT_MAX - CFG.EXPLORE_WAIT_MIN) + CFG.EXPLORE_WAIT_MIN
+					navTo(ai.exploreTarget, nil)
+					face(ai.exploreTarget)
+				else
+					humanoid:MoveTo(hrp.Position)
+				end
+			else
+				face(ai.exploreTarget)
+			end
+
+		elseif ai.state == STATE.ATTACK then
+			if not ai.target then
+				ai.state = STATE.EXPLORE
+			else
+				local tHRP = ai.target.HumanoidRootPart
+				local dist = (tHRP.Position - hrp.Position).Magnitude
+				if not ai.isAttacking then
+					if dist <= CFG.HEAVY_RANGE and now - ai.lastHeavyTime > CFG.COOLDOWN_HEAVY
+						and math.random() < (ai.rageActive and 0.55 or 0.38) then
+						task.spawn(heavyAttack)
+					elseif now - ai.lastLightTime > CFG.COOLDOWN_LIGHT then
+						task.spawn(lightAttack)
+					end
+				end
+				if dist > CFG.ATTACK_RANGE * 0.8 then
+					humanoid:MoveTo(tHRP.Position)
+				else
+					humanoid:MoveTo(hrp.Position)
+				end
+			end
+
+		elseif ai.state == STATE.LUNGE then
+			if ai.target and not ai.isLunging then
+				task.spawn(function()
+					performLunge(ai.target.HumanoidRootPart)
+				end)
+			else
+				ai.state = STATE.CHASE
+			end
+		end
+	end
+end)
+
+--============================================================
+--  🎬 ANIMACIONES DE MOVIMIENTO
+--============================================================
+humanoid.Running:Connect(function(spd)
+	if ai.isAttacking or ai.isLunging then return end
+	if spd > 22 then
+		stopAnim("IDLE"); stopAnim("WALK"); playAnim("RUN", 0.2)
+	elseif spd > 1 then
+		stopAnim("IDLE"); stopAnim("RUN"); playAnim("WALK", 0.2)
+	else
+		stopAnim("WALK"); stopAnim("RUN"); playAnim("IDLE", 0.2)
+	end
+end)
+
+--============================================================
+--  🚀 INICIALIZACION
+--============================================================
+playAnim("WALK", 0.1)
+
+task.defer(function()
+	local firstPoint = newExplorePoint()
+	ai.exploreTarget = firstPoint
+	navTo(firstPoint, nil)
+	face(firstPoint)
+end)
+
+print("[IntoTheChaos v21.3] ✅ Pathfinding mejorado: predicción, waypoint skip, stuck recovery")
+
+-- ============================================================
+--  ⚔️ SKAR AI — Perditionless v2.1
+--  Fixes vs v2.0:
+--    ✅ Ya no se congela después de atacar (timeout en animación)
+--    ✅ Nav se reinicia automáticamente tras cada ataque
+--    ✅ Steering detecta escaleras y pisos superiores (rayos verticales)
+--    ✅ Steering busca activamente subidas cuando el target está arriba
+-- ============================================================
+
+local PathfindingService = game:GetService("PathfindingService")
+local Players            = game:GetService("Players")
+local Debris             = game:GetService("Debris")
+local RunService         = game:GetService("RunService")
+
+-- ============================================================
+-- 🐛 DEBUG
+-- ============================================================
+local DEBUG_MODE = false
+
+local CLR = {
+	HITBOX  = Color3.fromRGB(255, 50,  50),
+	LOS     = Color3.fromRGB(0,   255, 80),
+	STEER   = Color3.fromRGB(255, 200, 0),
+	PATH    = Color3.fromRGB(0,   150, 255),
+	DANGER  = Color3.fromRGB(255, 0,   150),
+	STAIR   = Color3.fromRGB(0,   255, 255),
+}
+
+local debugFolder = Instance.new("Folder")
+debugFolder.Name   = "SkarDebug"
+debugFolder.Parent = workspace
+
+local stateLabel = nil
+
+local function dbg_sphere(pos, radius, color, lifetime)
+	if not DEBUG_MODE then return end
+	local p = Instance.new("Part")
+	p.Shape = Enum.PartType.Ball
+	p.Size  = Vector3.new(radius*2, radius*2, radius*2)
+	p.CFrame = CFrame.new(pos); p.Anchored = true
+	p.CanCollide = false; p.CanQuery = false
+	p.Material = Enum.Material.Neon; p.Color = color
+	p.Transparency = 0.5; p.CastShadow = false
+	p.Parent = debugFolder
+	if lifetime then Debris:AddItem(p, lifetime) end
+end
+
+local function dbg_ray(origin, dir, color, lifetime)
+	if not DEBUG_MODE then return end
+	local len = dir.Magnitude
+	if len < 0.1 then return end
+	local mid = origin + dir * 0.5
+	local p = Instance.new("Part")
+	p.Size = Vector3.new(0.1, 0.1, len)
+	p.CFrame = CFrame.lookAt(mid, origin + dir)
+	p.Anchored = true; p.CanCollide = false; p.CanQuery = false
+	p.Material = Enum.Material.Neon; p.Color = color
+	p.Transparency = 0.3; p.CastShadow = false
+	p.Parent = debugFolder
+	if lifetime then Debris:AddItem(p, lifetime) end
+end
+
+local function dbg_setState(text, color)
+	if not DEBUG_MODE or not stateLabel then return end
+	stateLabel.Text       = text
+	stateLabel.TextColor3 = color or Color3.fromRGB(255, 255, 255)
+end
+
+-- ============================================================
+-- 🔗 REFERENCIAS
+-- ============================================================
+local killer   = script.Parent
+local humanoid = killer:WaitForChild("Humanoid")
+local hrp      = killer:WaitForChild("HumanoidRootPart")
+local animator = humanoid:WaitForChild("Animator")
+
+if DEBUG_MODE then
+	local bb = Instance.new("BillboardGui")
+	bb.Name = "SkarDebugLabel"; bb.Size = UDim2.new(0, 220, 0, 55)
+	bb.StudsOffset = Vector3.new(0, 5, 0); bb.AlwaysOnTop = true
+	bb.Parent = killer
+	local lbl = Instance.new("TextLabel", bb)
+	lbl.Size = UDim2.new(1,0,1,0); lbl.BackgroundTransparency = 1
+	lbl.TextColor3 = Color3.fromRGB(255,255,255); lbl.TextStrokeTransparency = 0
+	lbl.TextScaled = true; lbl.Font = Enum.Font.GothamBold; lbl.Text = "SKAR"
+	stateLabel = lbl
+end
+
+-- ============================================================
+-- ⚙️ CONFIGURACIÓN
+-- ============================================================
+local CFG = {
+	PATROL_SPEED    = 12,
+	CHASE_SPEED     = 26,
+
+	ATTACK_RANGE    = 6.5,
+	ATTACK_DAMAGE   = 30,
+	ATTACK_COOLDOWN = 1.0,
+	HIT_RADIUS      = 5.5,
+	-- ✅ FIX: timeout máximo de animación de ataque
+	ATTACK_MAX_TIME = 3.0,
+
+	-- Steering horizontal
+	STEER_RAYS       = 16,   -- más rayos = más precisión al esquivar
+	STEER_DIST       = 7.0,
+	STEER_RATE       = 0.04,
+	STEER_REACH      = 12,
+
+	-- ✅ NUEVO: Steering vertical (escaleras y pisos)
+	-- Lanza rayos hacia arriba-adelante para detectar superficies pisables
+	STAIR_CHECK_DIST  = 9.0,   -- distancia horizontal al detectar escalera
+	STAIR_CHECK_H     = 6.0,   -- altura máxima de escalera/rampa detectable
+	STAIR_BONUS       = 2.2,   -- bonus de score para direcciones con subida
+	STAIR_VDIST       = 5.0,   -- distancia del rayo vertical hacia abajo para confirmar suelo
+
+	-- PathfindingService (solo respaldo)
+	PF_TRIGGER_TIME  = 2.5,
+	PF_STUCK_DIST    = 1.5,
+	PF_WAYPOINT_DIST = 3.5,
+	PF_TIMEOUT       = 2.5,
+
+	-- LOS
+	LOS_RATE = 0.03,
+
+	-- Caídas
+	FALL_DANGER_H = 18,
+
+	-- Patrulla
+	PATROL_MIN = 25,
+	PATROL_MAX = 55,
+
+	AGENT_PARAMS = {
+		AgentRadius     = 2.0,
+		AgentHeight     = 5.0,
+		AgentCanJump    = true,
+		AgentCanClimb   = true,
+		WaypointSpacing = 4.0,
+		Costs           = { Stairs = 0.5 },
+	},
+
+	ANIM_IDLE   = "112531404765757",
+	ANIM_WALK   = "124616914860563",
+	ANIM_ATTACK = "119371822095871",
+}
+
+-- ============================================================
+-- 🎵 ANIMACIONES
+-- ============================================================
+local function loadAnim(id)
+	local anim = Instance.new("Animation")
+	anim.AnimationId = "rbxassetid://" .. id
+	return animator:LoadAnimation(anim)
+end
+
+local trackIdle   = loadAnim(CFG.ANIM_IDLE)
+local trackWalk   = loadAnim(CFG.ANIM_WALK)
+local trackAttack = loadAnim(CFG.ANIM_ATTACK)
+trackAttack.Priority = Enum.AnimationPriority.Action
+
+local function setMoveAnim(track)
+	if track == trackIdle then
+		if not trackIdle.IsPlaying then trackWalk:Stop(0.1); trackIdle:Play(0.1) end
+	elseif track == trackWalk then
+		if not trackWalk.IsPlaying then trackIdle:Stop(0.1); trackWalk:Play(0.1) end
+	end
+end
+
+-- ============================================================
+-- 💥 HITBOX EN KEYFRAME "SLASH!"
+-- ============================================================
+local isAttacking    = false
+local lastAttackTime = 0
+
+trackAttack:GetMarkerReachedSignal("SLASH!"):Connect(function()
+	local center = (hrp.CFrame * CFrame.new(0, 0, -3)).Position
+	dbg_sphere(center, CFG.HIT_RADIUS, CLR.HITBOX, 0.35)
+	dbg_setState("⚔️ ATACANDO", Color3.fromRGB(255, 80, 80))
+
+	local params = OverlapParams.new()
+	params.FilterDescendantsInstances = {killer}
+	params.FilterType = Enum.RaycastFilterType.Exclude
+
+	local hit = {}
+	for _, part in pairs(workspace:GetPartBoundsInRadius(center, CFG.HIT_RADIUS, params)) do
+		local model = part:FindFirstAncestorOfClass("Model")
+		local hum   = model and model:FindFirstChild("Humanoid")
+		if model and hum and hum.Health > 0 and not hit[model] then
+			hit[model] = true
+			hum:TakeDamage(CFG.ATTACK_DAMAGE)
+			local s = Instance.new("Sound", hrp)
+			s.SoundId = "rbxassetid://566593606"
+			s.Volume  = 0.9; s:Play()
+			Debris:AddItem(s, 1)
+		end
+	end
+end)
+
+-- ✅ FIX PRINCIPAL DEL CONGELADO:
+-- Antes: trackAttack.Stopped:Wait() podía esperar para siempre
+-- Ahora: timeout de seguridad garantiza que isAttacking vuelva a false
+local function doAttack()
+	if isAttacking then return end
+	local now = tick()
+	if now - lastAttackTime < CFG.ATTACK_COOLDOWN then return end
+
+	isAttacking    = true
+	lastAttackTime = now
+	humanoid:MoveTo(hrp.Position)
+	trackIdle:Stop(0.05); trackWalk:Stop(0.05)
+	trackAttack:Play(0.05)
+
+	-- Esperar a que termine con timeout de seguridad
+	local waitStart = tick()
+	local done = false
+
+	-- Conexión a Stopped
+	local conn = trackAttack.Stopped:Connect(function()
+		done = true
+	end)
+
+	-- Esperar con timeout
+	while not done and (tick() - waitStart) < CFG.ATTACK_MAX_TIME do
+		task.wait(0.05)
+	end
+
+	conn:Disconnect()
+
+	-- Limpiar estado sin importar si terminó o se colgó
+	if trackAttack.IsPlaying then trackAttack:Stop(0.1) end
+	isAttacking = false
+end
+
+-- ============================================================
+-- 👁️ PERCEPCIÓN OMNISCIENTE
+-- ============================================================
+local navParams = RaycastParams.new()
+navParams.FilterDescendantsInstances = {killer}
+navParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local currentTarget    = nil
+local currentTargetHRP = nil
+
+local function updateTarget()
+	local nearest, minDist = nil, math.huge
+	for _, p in Players:GetPlayers() do
+		local char = p.Character
+		if char and char:FindFirstChild("Humanoid") and char.Humanoid.Health > 0
+			and char:FindFirstChild("HumanoidRootPart") then
+			local dist = (char.HumanoidRootPart.Position - hrp.Position).Magnitude
+			if dist < minDist then minDist = dist; nearest = char end
+		end
+	end
+	currentTarget    = nearest
+	currentTargetHRP = nearest and nearest:FindFirstChild("HumanoidRootPart") or nil
+	return nearest, minDist
+end
+
+local function getTargetPos()
+	if not currentTargetHRP or not currentTargetHRP.Parent then return nil end
+	return currentTargetHRP.Position
+end
+
+local function hasLOS(from, to)
+	local origin = from + Vector3.new(0, 1.5, 0)
+	local dir    = (to  + Vector3.new(0, 1.0, 0)) - origin
+	local result = workspace:Raycast(origin, dir, navParams)
+	return not result or result.Distance >= dir.Magnitude * 0.92
+end
+
+local function hasDangerousDrop(pos)
+	local hit = workspace:Raycast(
+		pos + Vector3.new(0, 3, 0),
+		Vector3.new(0, -(CFG.FALL_DANGER_H + 3), 0),
+		navParams
+	)
+	return not hit
+end
+
+-- ============================================================
+-- 🧭 ORIENTACIÓN — AlignOrientation
+-- ============================================================
+humanoid.AutoRotate = false
+
+local rootAtt = Instance.new("Attachment", hrp)
+rootAtt.Name  = "_SkarRootAtt"
+
+local alignOri = Instance.new("AlignOrientation", hrp)
+alignOri.Name           = "_SkarAlignOri"
+alignOri.Mode           = Enum.OrientationAlignmentMode.OneAttachment
+alignOri.Attachment0    = rootAtt
+alignOri.MaxTorque      = 1.5e5
+alignOri.Responsiveness = 30
+
+local targetFacePos = nil
+
+RunService.Heartbeat:Connect(function()
+	if not targetFacePos then return end
+	local flat = Vector3.new(targetFacePos.X, hrp.Position.Y, targetFacePos.Z)
+	local dir  = flat - hrp.Position
+	if dir.Magnitude < 0.4 then return end
+	alignOri.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + dir.Unit)
+end)
+
+local function face(pos) targetFacePos = pos end
+
+-- ============================================================
+-- 🛤️ CAPA 1: LOS DIRECTO
+-- ============================================================
+local function runLOS(getDestFn, activeFlag)
+	dbg_setState("👁️ LOS", CLR.LOS)
+	while activeFlag() do
+		task.wait(CFG.LOS_RATE)
+		if not activeFlag() or isAttacking then break end
+
+		local dest = getDestFn()
+		if not dest then break end
+
+		if (hrp.Position - dest).Magnitude < CFG.ATTACK_RANGE then break end
+		if not hasLOS(hrp.Position, dest) then break end
+		if hasDangerousDrop(dest) then break end
+
+		face(dest)
+		humanoid:MoveTo(dest)
+		if dest.Y > hrp.Position.Y + 2.5 then humanoid.Jump = true end
+	end
+end
+
+-- ============================================================
+-- 🔀 CAPA 2: RAYCAST STEERING MEJORADO
+-- ✅ NUEVO: además de rayos horizontales, detecta escaleras y
+-- superficies pisables en altura con rayos diagonales.
+-- ============================================================
+
+-- Precalcular ángulos de steering
+local STEER_ANGLES = {}
+for i = 0, CFG.STEER_RAYS - 1 do
+	STEER_ANGLES[i + 1] = (i / CFG.STEER_RAYS) * math.pi * 2
+end
+
+-- ✅ NUEVO: Detecta si hay una superficie pisable (escalera/rampa/plataforma)
+-- en una dirección horizontal dada, hasta cierta altura.
+-- Devuelve la Y del suelo encontrado, o nil si no hay.
+local function detectStairInDir(dir, targetHeight)
+	-- Lanzar rayo diagonal: desde la posición del killer + altura,
+	-- hacia adelante-abajo para encontrar el suelo de la escalera
+	local checkHeights = {2.0, 3.5, CFG.STAIR_CHECK_H}  -- probar a varias alturas
+
+	for _, h in ipairs(checkHeights) do
+		-- Solo nos interesa si el target está más arriba que nosotros
+		if targetHeight - hrp.Position.Y < 1.5 then break end
+
+		local startPos = hrp.Position + Vector3.new(0, h, 0)
+		local checkPos = startPos + dir * CFG.STAIR_CHECK_DIST
+
+		-- Rayo hacia abajo desde el punto de check
+		local groundHit = workspace:Raycast(
+			checkPos + Vector3.new(0, 2, 0),
+			Vector3.new(0, -(CFG.STAIR_VDIST + 2), 0),
+			navParams
+		)
+
+		if groundHit then
+			local floorY = groundHit.Position.Y
+			-- Es una subida válida si el suelo encontrado está más alto que donde estamos
+			if floorY > hrp.Position.Y + 0.3 then
+				if DEBUG_MODE then
+					dbg_sphere(groundHit.Position, 0.4, CLR.STAIR, 0.1)
+				end
+				return floorY
+			end
+		end
+	end
+	return nil
+end
+
+local function getBestSteerDir(targetPos)
+	local toTarget   = targetPos - hrp.Position
+	local flatTarget = Vector3.new(toTarget.X, 0, toTarget.Z)
+	if flatTarget.Magnitude < 0.1 then return nil end
+	local desired    = flatTarget.Unit
+	local heightDiff = targetPos.Y - hrp.Position.Y  -- ¿target está arriba o abajo?
+
+	local bestDir   = nil
+	local bestScore = -math.huge
+
+	for _, angle in ipairs(STEER_ANGLES) do
+		local testDir = Vector3.new(math.cos(angle), 0, math.sin(angle))
+
+		-- ── Rayo horizontal de obstáculo ─────────────────────
+		local rayOrigin = hrp.Position + Vector3.new(0, 1, 0)
+		local hit = workspace:Raycast(rayOrigin, testDir * CFG.STEER_DIST, navParams)
+
+		local clearDist = hit and hit.Distance or CFG.STEER_DIST
+		local isFree    = clearDist > CFG.STEER_DIST * 0.55
+
+		if isFree then
+			-- Score base: alineación con el target
+			local alignment  = testDir:Dot(desired)
+			local openBonus  = (clearDist / CFG.STEER_DIST) * 0.5
+
+			-- ✅ NUEVO: bonus de escalera/subida
+			-- Si el target está arriba y esta dirección tiene superficie pisable
+			-- a mayor altura, se le da un bonus fuerte
+			local stairBonus = 0
+			if heightDiff > 2.0 then
+				local stairY = detectStairInDir(testDir, targetPos.Y)
+				if stairY then
+					-- Bonus proporcional a qué tanto sube
+					local gain = math.clamp((stairY - hrp.Position.Y) / CFG.STAIR_CHECK_H, 0, 1)
+					stairBonus = gain * CFG.STAIR_BONUS
+
+					if DEBUG_MODE then
+						dbg_ray(
+							hrp.Position + Vector3.new(0, 1, 0),
+							testDir * CFG.STAIR_CHECK_DIST,
+							CLR.STAIR, 0.1
+						)
+					end
+				end
+			end
+
+			local score = alignment + openBonus + stairBonus
+
+			if DEBUG_MODE then
+				local rayColor = stairBonus > 0 and CLR.STAIR
+					or (alignment > 0.4 and CLR.STEER or Color3.fromRGB(80, 80, 80))
+				dbg_ray(rayOrigin, testDir * clearDist, rayColor, 0.06)
+			end
+
+			if score > bestScore then
+				bestScore = score
+				bestDir   = testDir
+			end
+		end
+	end
+
+	return bestDir, bestScore
+end
+
+local function runSteering(getDestFn, activeFlag)
+	dbg_setState("🔀 STEERING", CLR.STEER)
+
+	local stuckRef   = hrp.Position
+	local stuckTimer = 0
+	local pfThread   = nil
+	local pfActive   = false
+
+	local function startBackupPF(dest)
+		if pfActive then return end
+		pfActive = true
+		dbg_setState("🧭 PF RESPALDO", CLR.PATH)
+
+		pfThread = task.spawn(function()
+			local path = PathfindingService:CreatePath(CFG.AGENT_PARAMS)
+			local ok   = pcall(function() path:ComputeAsync(hrp.Position, dest) end)
+			if not ok or path.Status ~= Enum.PathStatus.Success then
+				pfActive = false; return
+			end
+
+			local wps = path:GetWaypoints()
+			for i = 2, #wps do
+				if not activeFlag() or not pfActive then break end
+				local wp = wps[i]
+
+				if i < #wps and hasLOS(hrp.Position, wps[i+1].Position) then continue end
+				if hasDangerousDrop(wp.Position) then pfActive = false; break end
+
+				if wp.Action == Enum.PathWaypointAction.Jump
+					or (wp.Position.Y - hrp.Position.Y) > 0.8 then
+					if humanoid.FloorMaterial ~= Enum.Material.Air then
+						humanoid.Jump = true; task.wait(0.1)
+					end
+				end
+
+				face(wp.Position)
+				humanoid:MoveTo(wp.Position)
+
+				local elapsed = 0
+				while elapsed < CFG.PF_TIMEOUT and activeFlag() and pfActive do
+					task.wait(0.05); elapsed += 0.05
+					if (hrp.Position - wp.Position).Magnitude < CFG.PF_WAYPOINT_DIST then break end
+					local tPos = getDestFn()
+					if tPos and hasLOS(hrp.Position, tPos) then pfActive = false; break end
+				end
+				if not pfActive then break end
+			end
+			pfActive = false
+		end)
+	end
+
+	local function stopBackupPF()
+		pfActive = false
+		if pfThread then pcall(function() task.cancel(pfThread) end); pfThread = nil end
+	end
+
+	while activeFlag() do
+		task.wait(CFG.STEER_RATE)
+		if not activeFlag() or isAttacking then break end
+
+		local dest = getDestFn()
+		if not dest then break end
+
+		if (hrp.Position - dest).Magnitude < CFG.ATTACK_RANGE then break end
+		if hasLOS(hrp.Position, dest) then stopBackupPF(); break end
+
+		local steerDir, steerScore = getBestSteerDir(dest)
+
+		if steerDir then
+			stopBackupPF()
+
+			local moveTarget = hrp.Position + steerDir * CFG.STEER_REACH
+
+			-- Snap al suelo del punto de destino
+			local groundHit = workspace:Raycast(
+				moveTarget + Vector3.new(0, CFG.STAIR_CHECK_H + 2, 0),
+				Vector3.new(0, -(CFG.STAIR_CHECK_H + CFG.STAIR_VDIST + 2), 0),
+				navParams
+			)
+			if groundHit then
+				local floorY = groundHit.Position.Y + 0.5
+				moveTarget = Vector3.new(moveTarget.X, floorY, moveTarget.Z)
+			end
+
+			-- ✅ Saltar si el punto de destino está más alto (escalera o rampa)
+			if moveTarget.Y > hrp.Position.Y + 0.6 then
+				if humanoid.FloorMaterial ~= Enum.Material.Air == false then
+					humanoid.Jump = true
+				end
+			end
+
+			-- Salto si el target está arriba y estamos en el suelo
+			if dest.Y > hrp.Position.Y + 3.0
+				and humanoid.FloorMaterial ~= Enum.Material.Air then
+				humanoid.Jump = true
+			end
+
+			face(dest)
+			humanoid:MoveTo(moveTarget)
+		else
+			if not pfActive then startBackupPF(dest) end
+		end
+
+		-- Stuck detection
+		stuckTimer += CFG.STEER_RATE
+		if stuckTimer >= CFG.PF_TRIGGER_TIME then
+			local moved = (hrp.Position - stuckRef).Magnitude
+			if moved < CFG.PF_STUCK_DIST then
+				if not pfActive then
+					startBackupPF(dest)
+				else
+					humanoid.Jump = true
+				end
+			end
+			stuckTimer = 0
+			stuckRef   = hrp.Position
+		end
+	end
+
+	stopBackupPF()
+end
+
+-- ============================================================
+-- 🗺️ NAVEGADOR PRINCIPAL
+-- ============================================================
+local navThread  = nil
+local navRunning = false
+
+local function stopNav()
+	navRunning = false
+	if navThread then pcall(function() task.cancel(navThread) end); navThread = nil end
+end
+
+local function startNav(getDestFn)
+	stopNav()
+	navRunning = true
+	navThread  = task.spawn(function()
+		while navRunning do
+			if isAttacking then task.wait(0.05); continue end
+
+			local dest = getDestFn()
+			if not dest then task.wait(0.05); continue end
+
+			if hasLOS(hrp.Position, dest) then
+				runLOS(getDestFn, function() return navRunning end)
+			else
+				runSteering(getDestFn, function() return navRunning end)
+			end
+
+			task.wait(0.02)
+		end
+	end)
+end
+
+-- ============================================================
+-- 🗺️ PATRULLA
+-- ============================================================
+local patrolTarget  = nil
+local patrolWaiting = false
+local visitedPatrol = {}
+
+local function groundSnap(pos)
+	local hit = workspace:Raycast(pos + Vector3.new(0,6,0), Vector3.new(0,-40,0), navParams)
+	if hit then return Vector3.new(pos.X, hit.Position.Y + 0.5, pos.Z) end
+	return pos
+end
+
+local function newPatrolPoint()
+	for attempt = 1, 15 do
+		local angle = (attempt / 15) * math.pi * 2 + math.random() * 0.8
+		local r     = CFG.PATROL_MIN + math.random() * (CFG.PATROL_MAX - CFG.PATROL_MIN)
+		local cand  = hrp.Position + Vector3.new(math.cos(angle)*r, 0, math.sin(angle)*r)
+		local hit   = workspace:Raycast(cand + Vector3.new(0,6,0), Vector3.new(0,-25,0), navParams)
+		if hit then
+			local snapped = Vector3.new(cand.X, hit.Position.Y + 0.5, cand.Z)
+			if hasDangerousDrop(snapped) then continue end
+			local tooClose = false
+			for _, vz in ipairs(visitedPatrol) do
+				if (snapped - vz).Magnitude < 20 then tooClose = true; break end
+			end
+			if not tooClose then
+				table.insert(visitedPatrol, snapped)
+				if #visitedPatrol > 6 then table.remove(visitedPatrol, 1) end
+				return snapped
+			end
+		end
+	end
+	return groundSnap(hrp.Position + Vector3.new(0, 0, 20))
+end
+
+-- ============================================================
+-- 🤖 BUCLE PRINCIPAL
+-- ============================================================
+trackIdle:Play(0.1)
+dbg_setState("🚶 PATRULLANDO", Color3.fromRGB(150, 150, 255))
+
+local chasing    = false
+local wasInRange = false  -- ✅ para saber cuándo salir del ataque y reiniciar nav
+
+task.defer(function()
+	patrolTarget = newPatrolPoint()
+	face(patrolTarget)
+	startNav(function() return patrolTarget end)
+end)
+
+task.spawn(function()
+	while task.wait(0.05) do
+		local _, dist = updateTarget()
+
+		-- ── SIN TARGET → PATRULLAR ────────────────────────────
+		if not currentTarget then
+			if chasing then
+				chasing = false
+				humanoid.WalkSpeed = CFG.PATROL_SPEED
+				patrolTarget = newPatrolPoint()
+				face(patrolTarget)
+				startNav(function() return patrolTarget end)
+				dbg_setState("🚶 PATRULLANDO", Color3.fromRGB(150, 150, 255))
+			end
+
+			humanoid.WalkSpeed = CFG.PATROL_SPEED
+
+			if patrolTarget and (hrp.Position - patrolTarget).Magnitude < 5 then
+				if not patrolWaiting then
+					patrolWaiting = true
+					stopNav()
+					humanoid:MoveTo(hrp.Position)
+					task.delay(0.8 + math.random() * 1.2, function()
+						patrolTarget  = newPatrolPoint()
+						patrolWaiting = false
+						face(patrolTarget)
+						startNav(function() return patrolTarget end)
+					end)
+				end
+			end
+
+			-- ── CON TARGET → PERSEGUIR O ATACAR ──────────────────
+		else
+			if not chasing then
+				chasing = true
+				humanoid.WalkSpeed = CFG.CHASE_SPEED
+				startNav(function() return getTargetPos() end)
+				dbg_setState("🏃 PERSIGUIENDO", Color3.fromRGB(255, 150, 0))
+			end
+
+			humanoid.WalkSpeed = CFG.CHASE_SPEED
+			local tPos = getTargetPos()
+			if tPos then face(tPos) end
+
+			if dist <= CFG.ATTACK_RANGE then
+				if not wasInRange then
+					wasInRange = true
+					stopNav()
+					humanoid:MoveTo(hrp.Position)
+				end
+				-- Atacar si no estamos atacando ya
+				if not isAttacking then
+					task.spawn(function()
+						doAttack()
+						-- ✅ FIX: al terminar el ataque, reiniciar nav
+						-- Esto evita que el killer se quede tieso tras golpear
+						if navRunning == false and currentTarget then
+							chasing = false  -- forzar reinicio en el siguiente tick
+						end
+					end)
+				end
+			else
+				-- ✅ Salió del rango → reiniciar persecución
+				if wasInRange then
+					wasInRange = false
+					chasing    = false  -- forzar reinicio de nav en siguiente tick
+				end
+			end
+		end
+
+		-- ── Animaciones por velocidad física ─────────────────
+		if not isAttacking then
+			local vel     = hrp.AssemblyLinearVelocity
+			local flatSpd = Vector3.new(vel.X, 0, vel.Z).Magnitude
+			setMoveAnim(flatSpd > 2 and trackWalk or trackIdle)
+		end
+	end
+end)
+
+-- ============================================================
+-- 🎬 ANIMACIONES POR RUNNING (respaldo)
+-- ============================================================
+humanoid.Running:Connect(function(spd)
+	if isAttacking then return end
+	setMoveAnim(spd > 1 and trackWalk or trackIdle)
+end)
+
+-- ============================================================
+-- 🧹 LIMPIEZA AL MORIR
+-- ============================================================
+humanoid.Died:Connect(function()
+	stopNav()
+	if debugFolder and debugFolder.Parent then debugFolder:Destroy() end
+end)
+
+if DEBUG_MODE then
+	print("[SKAR AI v2.1] ✅ Online — DEBUG ACTIVO")
+	print("  🟢 Verde    = LOS directo")
+	print("  🟡 Amarillo = Rayos steering")
+	print("  🔵 Cian     = Detección de escaleras")
+	print("  🔵 Azul     = Waypoints PF respaldo")
+	print("  🌸 Rosa     = Caída peligrosa")
+else
+	print("[SKAR AI v2.1] ✅ Online — Steering + escaleras + fix ataque")
+end
