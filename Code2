@@ -1,0 +1,749 @@
+-- ============================================================
+--  ⚔️ SKAR AI — Perditionless v2.1
+--  Fixes vs v2.0:
+--    ✅ Ya no se congela después de atacar (timeout en animación)
+--    ✅ Nav se reinicia automáticamente tras cada ataque
+--    ✅ Steering detecta escaleras y pisos superiores (rayos verticales)
+--    ✅ Steering busca activamente subidas cuando el target está arriba
+-- ============================================================
+
+local PathfindingService = game:GetService("PathfindingService")
+local Players            = game:GetService("Players")
+local Debris             = game:GetService("Debris")
+local RunService         = game:GetService("RunService")
+
+-- ============================================================
+-- 🐛 DEBUG
+-- ============================================================
+local DEBUG_MODE = false
+
+local CLR = {
+	HITBOX  = Color3.fromRGB(255, 50,  50),
+	LOS     = Color3.fromRGB(0,   255, 80),
+	STEER   = Color3.fromRGB(255, 200, 0),
+	PATH    = Color3.fromRGB(0,   150, 255),
+	DANGER  = Color3.fromRGB(255, 0,   150),
+	STAIR   = Color3.fromRGB(0,   255, 255),
+}
+
+local debugFolder = Instance.new("Folder")
+debugFolder.Name   = "SkarDebug"
+debugFolder.Parent = workspace
+
+local stateLabel = nil
+
+local function dbg_sphere(pos, radius, color, lifetime)
+	if not DEBUG_MODE then return end
+	local p = Instance.new("Part")
+	p.Shape = Enum.PartType.Ball
+	p.Size  = Vector3.new(radius*2, radius*2, radius*2)
+	p.CFrame = CFrame.new(pos); p.Anchored = true
+	p.CanCollide = false; p.CanQuery = false
+	p.Material = Enum.Material.Neon; p.Color = color
+	p.Transparency = 0.5; p.CastShadow = false
+	p.Parent = debugFolder
+	if lifetime then Debris:AddItem(p, lifetime) end
+end
+
+local function dbg_ray(origin, dir, color, lifetime)
+	if not DEBUG_MODE then return end
+	local len = dir.Magnitude
+	if len < 0.1 then return end
+	local mid = origin + dir * 0.5
+	local p = Instance.new("Part")
+	p.Size = Vector3.new(0.1, 0.1, len)
+	p.CFrame = CFrame.lookAt(mid, origin + dir)
+	p.Anchored = true; p.CanCollide = false; p.CanQuery = false
+	p.Material = Enum.Material.Neon; p.Color = color
+	p.Transparency = 0.3; p.CastShadow = false
+	p.Parent = debugFolder
+	if lifetime then Debris:AddItem(p, lifetime) end
+end
+
+local function dbg_setState(text, color)
+	if not DEBUG_MODE or not stateLabel then return end
+	stateLabel.Text       = text
+	stateLabel.TextColor3 = color or Color3.fromRGB(255, 255, 255)
+end
+
+-- ============================================================
+-- 🔗 REFERENCIAS
+-- ============================================================
+local killer   = script.Parent
+local humanoid = killer:WaitForChild("Humanoid")
+local hrp      = killer:WaitForChild("HumanoidRootPart")
+local animator = humanoid:WaitForChild("Animator")
+
+if DEBUG_MODE then
+	local bb = Instance.new("BillboardGui")
+	bb.Name = "SkarDebugLabel"; bb.Size = UDim2.new(0, 220, 0, 55)
+	bb.StudsOffset = Vector3.new(0, 5, 0); bb.AlwaysOnTop = true
+	bb.Parent = killer
+	local lbl = Instance.new("TextLabel", bb)
+	lbl.Size = UDim2.new(1,0,1,0); lbl.BackgroundTransparency = 1
+	lbl.TextColor3 = Color3.fromRGB(255,255,255); lbl.TextStrokeTransparency = 0
+	lbl.TextScaled = true; lbl.Font = Enum.Font.GothamBold; lbl.Text = "SKAR"
+	stateLabel = lbl
+end
+
+-- ============================================================
+-- ⚙️ CONFIGURACIÓN
+-- ============================================================
+local CFG = {
+	PATROL_SPEED    = 12,
+	CHASE_SPEED     = 26,
+
+	ATTACK_RANGE    = 6.5,
+	ATTACK_DAMAGE   = 30,
+	ATTACK_COOLDOWN = 1.0,
+	HIT_RADIUS      = 5.5,
+	-- ✅ FIX: timeout máximo de animación de ataque
+	ATTACK_MAX_TIME = 3.0,
+
+	-- Steering horizontal
+	STEER_RAYS       = 16,   -- más rayos = más precisión al esquivar
+	STEER_DIST       = 7.0,
+	STEER_RATE       = 0.04,
+	STEER_REACH      = 12,
+
+	-- ✅ NUEVO: Steering vertical (escaleras y pisos)
+	-- Lanza rayos hacia arriba-adelante para detectar superficies pisables
+	STAIR_CHECK_DIST  = 9.0,   -- distancia horizontal al detectar escalera
+	STAIR_CHECK_H     = 6.0,   -- altura máxima de escalera/rampa detectable
+	STAIR_BONUS       = 2.2,   -- bonus de score para direcciones con subida
+	STAIR_VDIST       = 5.0,   -- distancia del rayo vertical hacia abajo para confirmar suelo
+
+	-- PathfindingService (solo respaldo)
+	PF_TRIGGER_TIME  = 2.5,
+	PF_STUCK_DIST    = 1.5,
+	PF_WAYPOINT_DIST = 3.5,
+	PF_TIMEOUT       = 2.5,
+
+	-- LOS
+	LOS_RATE = 0.03,
+
+	-- Caídas
+	FALL_DANGER_H = 18,
+
+	-- Patrulla
+	PATROL_MIN = 25,
+	PATROL_MAX = 55,
+
+	AGENT_PARAMS = {
+		AgentRadius     = 2.0,
+		AgentHeight     = 5.0,
+		AgentCanJump    = true,
+		AgentCanClimb   = true,
+		WaypointSpacing = 4.0,
+		Costs           = { Stairs = 0.5 },
+	},
+
+	ANIM_IDLE   = "112531404765757",
+	ANIM_WALK   = "124616914860563",
+	ANIM_ATTACK = "119371822095871",
+}
+
+-- ============================================================
+-- 🎵 ANIMACIONES
+-- ============================================================
+local function loadAnim(id)
+	local anim = Instance.new("Animation")
+	anim.AnimationId = "rbxassetid://" .. id
+	return animator:LoadAnimation(anim)
+end
+
+local trackIdle   = loadAnim(CFG.ANIM_IDLE)
+local trackWalk   = loadAnim(CFG.ANIM_WALK)
+local trackAttack = loadAnim(CFG.ANIM_ATTACK)
+trackAttack.Priority = Enum.AnimationPriority.Action
+
+local function setMoveAnim(track)
+	if track == trackIdle then
+		if not trackIdle.IsPlaying then trackWalk:Stop(0.1); trackIdle:Play(0.1) end
+	elseif track == trackWalk then
+		if not trackWalk.IsPlaying then trackIdle:Stop(0.1); trackWalk:Play(0.1) end
+	end
+end
+
+-- ============================================================
+-- 💥 HITBOX EN KEYFRAME "SLASH!"
+-- ============================================================
+local isAttacking    = false
+local lastAttackTime = 0
+
+trackAttack:GetMarkerReachedSignal("SLASH!"):Connect(function()
+	local center = (hrp.CFrame * CFrame.new(0, 0, -3)).Position
+	dbg_sphere(center, CFG.HIT_RADIUS, CLR.HITBOX, 0.35)
+	dbg_setState("⚔️ ATACANDO", Color3.fromRGB(255, 80, 80))
+
+	local params = OverlapParams.new()
+	params.FilterDescendantsInstances = {killer}
+	params.FilterType = Enum.RaycastFilterType.Exclude
+
+	local hit = {}
+	for _, part in pairs(workspace:GetPartBoundsInRadius(center, CFG.HIT_RADIUS, params)) do
+		local model = part:FindFirstAncestorOfClass("Model")
+		local hum   = model and model:FindFirstChild("Humanoid")
+		if model and hum and hum.Health > 0 and not hit[model] then
+			hit[model] = true
+			hum:TakeDamage(CFG.ATTACK_DAMAGE)
+			local s = Instance.new("Sound", hrp)
+			s.SoundId = "rbxassetid://566593606"
+			s.Volume  = 0.9; s:Play()
+			Debris:AddItem(s, 1)
+		end
+	end
+end)
+
+-- ✅ FIX PRINCIPAL DEL CONGELADO:
+-- Antes: trackAttack.Stopped:Wait() podía esperar para siempre
+-- Ahora: timeout de seguridad garantiza que isAttacking vuelva a false
+local function doAttack()
+	if isAttacking then return end
+	local now = tick()
+	if now - lastAttackTime < CFG.ATTACK_COOLDOWN then return end
+
+	isAttacking    = true
+	lastAttackTime = now
+	humanoid:MoveTo(hrp.Position)
+	trackIdle:Stop(0.05); trackWalk:Stop(0.05)
+	trackAttack:Play(0.05)
+
+	-- Esperar a que termine con timeout de seguridad
+	local waitStart = tick()
+	local done = false
+
+	-- Conexión a Stopped
+	local conn = trackAttack.Stopped:Connect(function()
+		done = true
+	end)
+
+	-- Esperar con timeout
+	while not done and (tick() - waitStart) < CFG.ATTACK_MAX_TIME do
+		task.wait(0.05)
+	end
+
+	conn:Disconnect()
+
+	-- Limpiar estado sin importar si terminó o se colgó
+	if trackAttack.IsPlaying then trackAttack:Stop(0.1) end
+	isAttacking = false
+end
+
+-- ============================================================
+-- 👁️ PERCEPCIÓN OMNISCIENTE
+-- ============================================================
+local navParams = RaycastParams.new()
+navParams.FilterDescendantsInstances = {killer}
+navParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local currentTarget    = nil
+local currentTargetHRP = nil
+
+local function updateTarget()
+	local nearest, minDist = nil, math.huge
+	for _, p in Players:GetPlayers() do
+		local char = p.Character
+		if char and char:FindFirstChild("Humanoid") and char.Humanoid.Health > 0
+			and char:FindFirstChild("HumanoidRootPart") then
+			local dist = (char.HumanoidRootPart.Position - hrp.Position).Magnitude
+			if dist < minDist then minDist = dist; nearest = char end
+		end
+	end
+	currentTarget    = nearest
+	currentTargetHRP = nearest and nearest:FindFirstChild("HumanoidRootPart") or nil
+	return nearest, minDist
+end
+
+local function getTargetPos()
+	if not currentTargetHRP or not currentTargetHRP.Parent then return nil end
+	return currentTargetHRP.Position
+end
+
+local function hasLOS(from, to)
+	local origin = from + Vector3.new(0, 1.5, 0)
+	local dir    = (to  + Vector3.new(0, 1.0, 0)) - origin
+	local result = workspace:Raycast(origin, dir, navParams)
+	return not result or result.Distance >= dir.Magnitude * 0.92
+end
+
+local function hasDangerousDrop(pos)
+	local hit = workspace:Raycast(
+		pos + Vector3.new(0, 3, 0),
+		Vector3.new(0, -(CFG.FALL_DANGER_H + 3), 0),
+		navParams
+	)
+	return not hit
+end
+
+-- ============================================================
+-- 🧭 ORIENTACIÓN — AlignOrientation
+-- ============================================================
+humanoid.AutoRotate = false
+
+local rootAtt = Instance.new("Attachment", hrp)
+rootAtt.Name  = "_SkarRootAtt"
+
+local alignOri = Instance.new("AlignOrientation", hrp)
+alignOri.Name           = "_SkarAlignOri"
+alignOri.Mode           = Enum.OrientationAlignmentMode.OneAttachment
+alignOri.Attachment0    = rootAtt
+alignOri.MaxTorque      = 1.5e5
+alignOri.Responsiveness = 30
+
+local targetFacePos = nil
+
+RunService.Heartbeat:Connect(function()
+	if not targetFacePos then return end
+	local flat = Vector3.new(targetFacePos.X, hrp.Position.Y, targetFacePos.Z)
+	local dir  = flat - hrp.Position
+	if dir.Magnitude < 0.4 then return end
+	alignOri.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + dir.Unit)
+end)
+
+local function face(pos) targetFacePos = pos end
+
+-- ============================================================
+-- 🛤️ CAPA 1: LOS DIRECTO
+-- ============================================================
+local function runLOS(getDestFn, activeFlag)
+	dbg_setState("👁️ LOS", CLR.LOS)
+	while activeFlag() do
+		task.wait(CFG.LOS_RATE)
+		if not activeFlag() or isAttacking then break end
+
+		local dest = getDestFn()
+		if not dest then break end
+
+		if (hrp.Position - dest).Magnitude < CFG.ATTACK_RANGE then break end
+		if not hasLOS(hrp.Position, dest) then break end
+		if hasDangerousDrop(dest) then break end
+
+		face(dest)
+		humanoid:MoveTo(dest)
+		if dest.Y > hrp.Position.Y + 2.5 then humanoid.Jump = true end
+	end
+end
+
+-- ============================================================
+-- 🔀 CAPA 2: RAYCAST STEERING MEJORADO
+-- ✅ NUEVO: además de rayos horizontales, detecta escaleras y
+-- superficies pisables en altura con rayos diagonales.
+-- ============================================================
+
+-- Precalcular ángulos de steering
+local STEER_ANGLES = {}
+for i = 0, CFG.STEER_RAYS - 1 do
+	STEER_ANGLES[i + 1] = (i / CFG.STEER_RAYS) * math.pi * 2
+end
+
+-- ✅ NUEVO: Detecta si hay una superficie pisable (escalera/rampa/plataforma)
+-- en una dirección horizontal dada, hasta cierta altura.
+-- Devuelve la Y del suelo encontrado, o nil si no hay.
+local function detectStairInDir(dir, targetHeight)
+	-- Lanzar rayo diagonal: desde la posición del killer + altura,
+	-- hacia adelante-abajo para encontrar el suelo de la escalera
+	local checkHeights = {2.0, 3.5, CFG.STAIR_CHECK_H}  -- probar a varias alturas
+
+	for _, h in ipairs(checkHeights) do
+		-- Solo nos interesa si el target está más arriba que nosotros
+		if targetHeight - hrp.Position.Y < 1.5 then break end
+
+		local startPos = hrp.Position + Vector3.new(0, h, 0)
+		local checkPos = startPos + dir * CFG.STAIR_CHECK_DIST
+
+		-- Rayo hacia abajo desde el punto de check
+		local groundHit = workspace:Raycast(
+			checkPos + Vector3.new(0, 2, 0),
+			Vector3.new(0, -(CFG.STAIR_VDIST + 2), 0),
+			navParams
+		)
+
+		if groundHit then
+			local floorY = groundHit.Position.Y
+			-- Es una subida válida si el suelo encontrado está más alto que donde estamos
+			if floorY > hrp.Position.Y + 0.3 then
+				if DEBUG_MODE then
+					dbg_sphere(groundHit.Position, 0.4, CLR.STAIR, 0.1)
+				end
+				return floorY
+			end
+		end
+	end
+	return nil
+end
+
+local function getBestSteerDir(targetPos)
+	local toTarget   = targetPos - hrp.Position
+	local flatTarget = Vector3.new(toTarget.X, 0, toTarget.Z)
+	if flatTarget.Magnitude < 0.1 then return nil end
+	local desired    = flatTarget.Unit
+	local heightDiff = targetPos.Y - hrp.Position.Y  -- ¿target está arriba o abajo?
+
+	local bestDir   = nil
+	local bestScore = -math.huge
+
+	for _, angle in ipairs(STEER_ANGLES) do
+		local testDir = Vector3.new(math.cos(angle), 0, math.sin(angle))
+
+		-- ── Rayo horizontal de obstáculo ─────────────────────
+		local rayOrigin = hrp.Position + Vector3.new(0, 1, 0)
+		local hit = workspace:Raycast(rayOrigin, testDir * CFG.STEER_DIST, navParams)
+
+		local clearDist = hit and hit.Distance or CFG.STEER_DIST
+		local isFree    = clearDist > CFG.STEER_DIST * 0.55
+
+		if isFree then
+			-- Score base: alineación con el target
+			local alignment  = testDir:Dot(desired)
+			local openBonus  = (clearDist / CFG.STEER_DIST) * 0.5
+
+			-- ✅ NUEVO: bonus de escalera/subida
+			-- Si el target está arriba y esta dirección tiene superficie pisable
+			-- a mayor altura, se le da un bonus fuerte
+			local stairBonus = 0
+			if heightDiff > 2.0 then
+				local stairY = detectStairInDir(testDir, targetPos.Y)
+				if stairY then
+					-- Bonus proporcional a qué tanto sube
+					local gain = math.clamp((stairY - hrp.Position.Y) / CFG.STAIR_CHECK_H, 0, 1)
+					stairBonus = gain * CFG.STAIR_BONUS
+
+					if DEBUG_MODE then
+						dbg_ray(
+							hrp.Position + Vector3.new(0, 1, 0),
+							testDir * CFG.STAIR_CHECK_DIST,
+							CLR.STAIR, 0.1
+						)
+					end
+				end
+			end
+
+			local score = alignment + openBonus + stairBonus
+
+			if DEBUG_MODE then
+				local rayColor = stairBonus > 0 and CLR.STAIR
+					or (alignment > 0.4 and CLR.STEER or Color3.fromRGB(80, 80, 80))
+				dbg_ray(rayOrigin, testDir * clearDist, rayColor, 0.06)
+			end
+
+			if score > bestScore then
+				bestScore = score
+				bestDir   = testDir
+			end
+		end
+	end
+
+	return bestDir, bestScore
+end
+
+local function runSteering(getDestFn, activeFlag)
+	dbg_setState("🔀 STEERING", CLR.STEER)
+
+	local stuckRef   = hrp.Position
+	local stuckTimer = 0
+	local pfThread   = nil
+	local pfActive   = false
+
+	local function startBackupPF(dest)
+		if pfActive then return end
+		pfActive = true
+		dbg_setState("🧭 PF RESPALDO", CLR.PATH)
+
+		pfThread = task.spawn(function()
+			local path = PathfindingService:CreatePath(CFG.AGENT_PARAMS)
+			local ok   = pcall(function() path:ComputeAsync(hrp.Position, dest) end)
+			if not ok or path.Status ~= Enum.PathStatus.Success then
+				pfActive = false; return
+			end
+
+			local wps = path:GetWaypoints()
+			for i = 2, #wps do
+				if not activeFlag() or not pfActive then break end
+				local wp = wps[i]
+
+				if i < #wps and hasLOS(hrp.Position, wps[i+1].Position) then continue end
+				if hasDangerousDrop(wp.Position) then pfActive = false; break end
+
+				if wp.Action == Enum.PathWaypointAction.Jump
+					or (wp.Position.Y - hrp.Position.Y) > 0.8 then
+					if humanoid.FloorMaterial ~= Enum.Material.Air then
+						humanoid.Jump = true; task.wait(0.1)
+					end
+				end
+
+				face(wp.Position)
+				humanoid:MoveTo(wp.Position)
+
+				local elapsed = 0
+				while elapsed < CFG.PF_TIMEOUT and activeFlag() and pfActive do
+					task.wait(0.05); elapsed += 0.05
+					if (hrp.Position - wp.Position).Magnitude < CFG.PF_WAYPOINT_DIST then break end
+					local tPos = getDestFn()
+					if tPos and hasLOS(hrp.Position, tPos) then pfActive = false; break end
+				end
+				if not pfActive then break end
+			end
+			pfActive = false
+		end)
+	end
+
+	local function stopBackupPF()
+		pfActive = false
+		if pfThread then pcall(function() task.cancel(pfThread) end); pfThread = nil end
+	end
+
+	while activeFlag() do
+		task.wait(CFG.STEER_RATE)
+		if not activeFlag() or isAttacking then break end
+
+		local dest = getDestFn()
+		if not dest then break end
+
+		if (hrp.Position - dest).Magnitude < CFG.ATTACK_RANGE then break end
+		if hasLOS(hrp.Position, dest) then stopBackupPF(); break end
+
+		local steerDir, steerScore = getBestSteerDir(dest)
+
+		if steerDir then
+			stopBackupPF()
+
+			local moveTarget = hrp.Position + steerDir * CFG.STEER_REACH
+
+			-- Snap al suelo del punto de destino
+			local groundHit = workspace:Raycast(
+				moveTarget + Vector3.new(0, CFG.STAIR_CHECK_H + 2, 0),
+				Vector3.new(0, -(CFG.STAIR_CHECK_H + CFG.STAIR_VDIST + 2), 0),
+				navParams
+			)
+			if groundHit then
+				local floorY = groundHit.Position.Y + 0.5
+				moveTarget = Vector3.new(moveTarget.X, floorY, moveTarget.Z)
+			end
+
+			-- ✅ Saltar si el punto de destino está más alto (escalera o rampa)
+			if moveTarget.Y > hrp.Position.Y + 0.6 then
+				if humanoid.FloorMaterial ~= Enum.Material.Air == false then
+					humanoid.Jump = true
+				end
+			end
+
+			-- Salto si el target está arriba y estamos en el suelo
+			if dest.Y > hrp.Position.Y + 3.0
+				and humanoid.FloorMaterial ~= Enum.Material.Air then
+				humanoid.Jump = true
+			end
+
+			face(dest)
+			humanoid:MoveTo(moveTarget)
+		else
+			if not pfActive then startBackupPF(dest) end
+		end
+
+		-- Stuck detection
+		stuckTimer += CFG.STEER_RATE
+		if stuckTimer >= CFG.PF_TRIGGER_TIME then
+			local moved = (hrp.Position - stuckRef).Magnitude
+			if moved < CFG.PF_STUCK_DIST then
+				if not pfActive then
+					startBackupPF(dest)
+				else
+					humanoid.Jump = true
+				end
+			end
+			stuckTimer = 0
+			stuckRef   = hrp.Position
+		end
+	end
+
+	stopBackupPF()
+end
+
+-- ============================================================
+-- 🗺️ NAVEGADOR PRINCIPAL
+-- ============================================================
+local navThread  = nil
+local navRunning = false
+
+local function stopNav()
+	navRunning = false
+	if navThread then pcall(function() task.cancel(navThread) end); navThread = nil end
+end
+
+local function startNav(getDestFn)
+	stopNav()
+	navRunning = true
+	navThread  = task.spawn(function()
+		while navRunning do
+			if isAttacking then task.wait(0.05); continue end
+
+			local dest = getDestFn()
+			if not dest then task.wait(0.05); continue end
+
+			if hasLOS(hrp.Position, dest) then
+				runLOS(getDestFn, function() return navRunning end)
+			else
+				runSteering(getDestFn, function() return navRunning end)
+			end
+
+			task.wait(0.02)
+		end
+	end)
+end
+
+-- ============================================================
+-- 🗺️ PATRULLA
+-- ============================================================
+local patrolTarget  = nil
+local patrolWaiting = false
+local visitedPatrol = {}
+
+local function groundSnap(pos)
+	local hit = workspace:Raycast(pos + Vector3.new(0,6,0), Vector3.new(0,-40,0), navParams)
+	if hit then return Vector3.new(pos.X, hit.Position.Y + 0.5, pos.Z) end
+	return pos
+end
+
+local function newPatrolPoint()
+	for attempt = 1, 15 do
+		local angle = (attempt / 15) * math.pi * 2 + math.random() * 0.8
+		local r     = CFG.PATROL_MIN + math.random() * (CFG.PATROL_MAX - CFG.PATROL_MIN)
+		local cand  = hrp.Position + Vector3.new(math.cos(angle)*r, 0, math.sin(angle)*r)
+		local hit   = workspace:Raycast(cand + Vector3.new(0,6,0), Vector3.new(0,-25,0), navParams)
+		if hit then
+			local snapped = Vector3.new(cand.X, hit.Position.Y + 0.5, cand.Z)
+			if hasDangerousDrop(snapped) then continue end
+			local tooClose = false
+			for _, vz in ipairs(visitedPatrol) do
+				if (snapped - vz).Magnitude < 20 then tooClose = true; break end
+			end
+			if not tooClose then
+				table.insert(visitedPatrol, snapped)
+				if #visitedPatrol > 6 then table.remove(visitedPatrol, 1) end
+				return snapped
+			end
+		end
+	end
+	return groundSnap(hrp.Position + Vector3.new(0, 0, 20))
+end
+
+-- ============================================================
+-- 🤖 BUCLE PRINCIPAL
+-- ============================================================
+trackIdle:Play(0.1)
+dbg_setState("🚶 PATRULLANDO", Color3.fromRGB(150, 150, 255))
+
+local chasing    = false
+local wasInRange = false  -- ✅ para saber cuándo salir del ataque y reiniciar nav
+
+task.defer(function()
+	patrolTarget = newPatrolPoint()
+	face(patrolTarget)
+	startNav(function() return patrolTarget end)
+end)
+
+task.spawn(function()
+	while task.wait(0.05) do
+		local _, dist = updateTarget()
+
+		-- ── SIN TARGET → PATRULLAR ────────────────────────────
+		if not currentTarget then
+			if chasing then
+				chasing = false
+				humanoid.WalkSpeed = CFG.PATROL_SPEED
+				patrolTarget = newPatrolPoint()
+				face(patrolTarget)
+				startNav(function() return patrolTarget end)
+				dbg_setState("🚶 PATRULLANDO", Color3.fromRGB(150, 150, 255))
+			end
+
+			humanoid.WalkSpeed = CFG.PATROL_SPEED
+
+			if patrolTarget and (hrp.Position - patrolTarget).Magnitude < 5 then
+				if not patrolWaiting then
+					patrolWaiting = true
+					stopNav()
+					humanoid:MoveTo(hrp.Position)
+					task.delay(0.8 + math.random() * 1.2, function()
+						patrolTarget  = newPatrolPoint()
+						patrolWaiting = false
+						face(patrolTarget)
+						startNav(function() return patrolTarget end)
+					end)
+				end
+			end
+
+			-- ── CON TARGET → PERSEGUIR O ATACAR ──────────────────
+		else
+			if not chasing then
+				chasing = true
+				humanoid.WalkSpeed = CFG.CHASE_SPEED
+				startNav(function() return getTargetPos() end)
+				dbg_setState("🏃 PERSIGUIENDO", Color3.fromRGB(255, 150, 0))
+			end
+
+			humanoid.WalkSpeed = CFG.CHASE_SPEED
+			local tPos = getTargetPos()
+			if tPos then face(tPos) end
+
+			if dist <= CFG.ATTACK_RANGE then
+				if not wasInRange then
+					wasInRange = true
+					stopNav()
+					humanoid:MoveTo(hrp.Position)
+				end
+				-- Atacar si no estamos atacando ya
+				if not isAttacking then
+					task.spawn(function()
+						doAttack()
+						-- ✅ FIX: al terminar el ataque, reiniciar nav
+						-- Esto evita que el killer se quede tieso tras golpear
+						if navRunning == false and currentTarget then
+							chasing = false  -- forzar reinicio en el siguiente tick
+						end
+					end)
+				end
+			else
+				-- ✅ Salió del rango → reiniciar persecución
+				if wasInRange then
+					wasInRange = false
+					chasing    = false  -- forzar reinicio de nav en siguiente tick
+				end
+			end
+		end
+
+		-- ── Animaciones por velocidad física ─────────────────
+		if not isAttacking then
+			local vel     = hrp.AssemblyLinearVelocity
+			local flatSpd = Vector3.new(vel.X, 0, vel.Z).Magnitude
+			setMoveAnim(flatSpd > 2 and trackWalk or trackIdle)
+		end
+	end
+end)
+
+-- ============================================================
+-- 🎬 ANIMACIONES POR RUNNING (respaldo)
+-- ============================================================
+humanoid.Running:Connect(function(spd)
+	if isAttacking then return end
+	setMoveAnim(spd > 1 and trackWalk or trackIdle)
+end)
+
+-- ============================================================
+-- 🧹 LIMPIEZA AL MORIR
+-- ============================================================
+humanoid.Died:Connect(function()
+	stopNav()
+	if debugFolder and debugFolder.Parent then debugFolder:Destroy() end
+end)
+
+if DEBUG_MODE then
+	print("[SKAR AI v2.1] ✅ Online — DEBUG ACTIVO")
+	print("  🟢 Verde    = LOS directo")
+	print("  🟡 Amarillo = Rayos steering")
+	print("  🔵 Cian     = Detección de escaleras")
+	print("  🔵 Azul     = Waypoints PF respaldo")
+	print("  🌸 Rosa     = Caída peligrosa")
+else
+	print("[SKAR AI v2.1] ✅ Online — Steering + escaleras + fix ataque")
+end
